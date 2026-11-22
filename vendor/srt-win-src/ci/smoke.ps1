@@ -2,8 +2,8 @@
   srt-win install/uninstall lifecycle smoke test.
 
   Exercises `srt-win install` (provisions the `srt-sandbox` user +
-  user-SID-keyed WFP filter set) and `srt-win uninstall` against a
-  built srt-win.exe. Throws on any assertion failure. Requires
+  its `srt-sandbox-open` pair + user-SID-keyed WFP filter set) and
+  `srt-win uninstall` against a built srt-win.exe. Throws on any assertion failure. Requires
   elevation (NetUserAdd / Fwpm* both need admin).
 
   Usage (local dev machine):
@@ -90,12 +90,43 @@ if (-not $us.user.in_sandbox_group)  { throw "install: sandbox user not in sandb
 if (-not $us.user.hidden_from_logon) { throw "install: sandbox user not hidden from Winlogon" }
 if (-not $us.cred_present)           { throw "install: credential not present (HKLM Cred\Blob)" }
 # Keep in sync with SETUP_VERSION (vendor/srt-win-src/src/install.rs).
-$SetupVersion = 3
+$SetupVersion = 4
 if ($us.marker_version -ne $SetupVersion) { throw "install: setup marker version expected $SetupVersion, got $($us.marker_version)" }
 if ($us.setup_version -ne $SetupVersion)  { throw "install: user status setup_version expected $SetupVersion, got $($us.setup_version)" }
 if ($us.marker_user_sid -ne $us.user.sid) {
   throw "install: marker SID '$($us.marker_user_sid)' != live SID '$($us.user.sid)'"
 }
+
+# ── open account: what a gate-off session runs as ───────────────────
+# Same group and profile handling as the filtered account, no WFP
+# filters of its own.
+if (-not $us.open_account_supported) {
+  throw 'install: user status does not report the open account'
+}
+if (-not $us.open_user.exists)  { throw 'install: open sandbox user not provisioned' }
+if (-not $us.open_user.sid -or -not $us.open_user.sid.StartsWith('S-1-5-21-')) {
+  throw "install: open sandbox user SID missing or malformed: '$($us.open_user.sid)'"
+}
+if ($us.open_user.sid -eq $us.user.sid) {
+  throw "install: open sandbox user shares the filtered user's SID '$($us.open_user.sid)'"
+}
+if (-not $us.open_user.group_exists) { throw 'install: sandbox-runtime-users group missing (open account)' }
+if (-not $us.open_user.in_builtin_users) {
+  throw 'install: open sandbox user not in BUILTIN\Users'
+}
+if (-not $us.open_user.in_sandbox_group) {
+  throw 'install: open sandbox user not in sandbox-runtime-users'
+}
+if (-not $us.open_user.hidden_from_logon) {
+  throw 'install: open sandbox user not hidden from Winlogon'
+}
+if (-not $us.open_cred_present) {
+  throw 'install: open-account credential not present (HKLM Cred\BlobOpen)'
+}
+if ($us.open_marker_user_sid -ne $us.open_user.sid) {
+  throw "install: open marker SID '$($us.open_marker_user_sid)' != live SID '$($us.open_user.sid)'"
+}
+Write-Host "install ok: open account provisioned (sid=$($us.open_user.sid))"
 if ($iw.user_sid -ne $us.user.sid) {
   throw "install: WFP user_sid '$($iw.user_sid)' != provisioned '$($us.user.sid)'"
 }
@@ -386,6 +417,9 @@ $us0 = J @('user', 'status')
 if (-not $us0.user.exists -or -not $us0.cred_present) {
   throw "uninstall --keep-user: sandbox user/cred should be kept"
 }
+if (-not $us0.open_user.exists -or -not $us0.open_cred_present) {
+  throw "uninstall --keep-user: open sandbox user/cred should be kept"
+}
 
 # ── wfp verify (fence-INACTIVE): connect succeeds ───────────────────
 # Filters were just removed (`uninstall --keep-user`) but the
@@ -420,6 +454,12 @@ $usGone = J @('user', 'status')
 if ($usGone.user.exists) {
   throw "uninstall: sandbox user should be removed, got $($usGone | ConvertTo-Json -Compress)"
 }
+if ($usGone.open_user.exists) {
+  throw "uninstall: open sandbox user should be removed, got $($usGone | ConvertTo-Json -Compress)"
+}
+if ($usGone.open_cred_present) {
+  throw "uninstall: open-account credential row should be cleared"
+}
 if ($usGone.cred_present) {
   throw "uninstall: credential row should be cleared"
 }
@@ -443,7 +483,14 @@ if ($usc.user.name -ne 'srt-sb-custom') {
 if (-not $usc.user.exists -or -not $usc.user.sid.StartsWith('S-1-5-21-')) {
   throw "U1: srt-sb-custom not provisioned; got $($usc | ConvertTo-Json -Compress)"
 }
-Write-Host "U1 ok: --sandbox-user srt-sb-custom provisioned (sid=$($usc.user.sid))"
+# The open account pairs with whatever name the filtered one has.
+if ($usc.open_user.name -ne 'srt-sb-custom-open') {
+  throw "U1: expected open_user.name='srt-sb-custom-open', got '$($usc.open_user.name)'"
+}
+if (-not $usc.open_user.exists -or $usc.open_marker_user_sid -ne $usc.open_user.sid) {
+  throw "U1: srt-sb-custom-open not provisioned; got $($usc | ConvertTo-Json -Compress)"
+}
+Write-Host "U1 ok: --sandbox-user srt-sb-custom provisioned (sid=$($usc.user.sid), open=$($usc.open_user.sid))"
 # Re-install with the DEFAULT name and no --force → exit 13
 # (recorded name differs).
 & $Exe @(@('install') + $isl + $pr) 2>$null
@@ -456,7 +503,11 @@ net user srt-sb-custom 2>$null
 if ($LASTEXITCODE -eq 0) {
   throw "U1: srt-sb-custom account still exists after uninstall"
 }
-Write-Host 'U1 ok: uninstall removes the recorded custom-name account'
+net user srt-sb-custom-open 2>$null
+if ($LASTEXITCODE -eq 0) {
+  throw "U1: srt-sb-custom-open account still exists after uninstall"
+}
+Write-Host 'U1 ok: uninstall removes the recorded custom-name account and its open pair'
 
 # ── U1c: --sandbox-user rejects a name we didn't create ────────────
 # `Administrators` resolves (as an alias) → the ownership guard at

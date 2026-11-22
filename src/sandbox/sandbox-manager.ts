@@ -85,6 +85,9 @@ import {
   grantWindowsAclPersistent,
   WINDOWS_INSTALL_COMMAND,
   windowsSetupVersionMismatch,
+  windowsOpenAccountMismatch,
+  windowsSandboxAccountRole,
+  type WindowsSandboxAccountRole,
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
   windowsGrantsBeneathDenies,
@@ -192,6 +195,14 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+// Once initialize() sees `network.enabled: false` no proxy is started, so
+// the gate stays off for the session: updateConfig() cannot turn it back on
+// without a reset() and a new initialize().
+let sessionNetworkDisabled = false
+// Windows: which sandbox account this session's commands run as. Fixed
+// at initialize(), like the gate it follows: a session with the gate off
+// runs as the open account. `windowsFsSbUserSid` is that account's SID.
+let sessionSandboxAccount: WindowsSandboxAccountRole = 'filtered'
 // The initialize() in flight, from its first step: a profile grant refresh
 // can hold it for minutes before initializationPromise exists. reset()
 // moves the generation on, which cancels it.
@@ -787,6 +798,14 @@ async function filterNetworkRequest(
   if (!config) {
     logForDebugging('No config available, denying network request')
     return denied('sandbox policy unavailable')
+  }
+
+  // The gate: when network is disabled the proxy is not started, but an
+  // external proxy or a port still in use must not apply a policy the
+  // configuration says does not apply.
+  if (config.network.enabled === false) {
+    logForDebugging(`Network disabled; allowing ${host}:${port}`)
+    return true
   }
 
   // Reject hosts containing control characters before pattern matching.
@@ -1426,11 +1445,15 @@ async function initializeSteps(
       try {
         probeRequest = buildMxcRequest({
           command: 'exit 0',
+          // The gate: with network disabled the probe carries open
+          // egress and no proxy, the same policy every spawn gets.
+          networkEnabled: runtimeConfig.network.enabled !== false,
           // Representative proxy port: the real mux port is bound
           // later in initialize (inside this same range on Windows),
           // and the probe only needs the policy shape, not a live
           // listener.
           httpProxyPort:
+            runtimeConfig.network.enabled !== false &&
             runtimeConfig.network.allowedDomains !== undefined
               ? DEFAULT_WINDOWS_PROXY_PORT_RANGE[0]
               : undefined,
@@ -1459,6 +1482,11 @@ async function initializeSteps(
     const srtWin = srtWinSpawn
     const u = await getWindowsSandboxUserStatusAsync({ srtWin })
     stopIfReset()
+    // The gate: a session with network disabled runs its commands as
+    // the open account, which has no WFP filters keyed on its SID.
+    // Every other session runs as the filtered one. Fixed for the
+    // session, as the gate is.
+    const accountRole = windowsSandboxAccountRole(runtimeConfig.network.enabled)
     if (!u.provisioned || !u.credPresent) {
       config = undefined
       throw new WindowsSandboxError(
@@ -1469,16 +1497,30 @@ async function initializeSteps(
           `provision it.`,
       )
     }
+    const installCtx = {
+      sublayerGuid:
+        runtimeConfig.windows?.sublayerGuid ??
+        runtimeConfig.windows?.wfpSublayerGuid,
+      proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+      sandboxUser: runtimeConfig.windows?.sandboxUser,
+      allowLoopback: runtimeConfig.network?.allowLocalBinding === true,
+    }
     // srt-win refuses to launch on an install of another setup
     // version; checked before anything is granted.
-    const staleSetup = windowsSetupVersionMismatch(
-      u,
-      runtimeConfig.windows?.sublayerGuid ??
-        runtimeConfig.windows?.wfpSublayerGuid,
-    )
+    const staleSetup = windowsSetupVersionMismatch(u, installCtx.sublayerGuid)
     if (staleSetup) {
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
+    }
+    // A gate-off session needs the open account: there is no falling
+    // back to the filtered one (whose filters would break it) or to
+    // the real user (no sandbox at all).
+    if (accountRole === 'open') {
+      const noOpen = windowsOpenAccountMismatch(u, installCtx)
+      if (noOpen) {
+        config = undefined
+        throw new WindowsSandboxError('reinstall_required', noOpen)
+      }
     }
     // initialize() writes the profile read grant only to narrow one
     // already there (windowsProfileGrantRefreshable).
@@ -1690,14 +1732,16 @@ async function initializeSteps(
         : acc.grantRead
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
-      // status` here.
-      if (!u.sid) {
+      // status` here. The open account's row was checked above; this is
+      // its SID, and the session's ACEs are stamped on it.
+      const sb = accountRole === 'open' ? u.openSid : u.sid
+      if (!sb) {
         throw new Error(
-          'sandbox user SID missing from `srt-win user status` ' +
+          (accountRole === 'open' ? 'open sandbox account' : 'sandbox user') +
+            ' SID missing from `srt-win user status` ' +
             '(provisioned but in an inconsistent state)',
         )
       }
-      const sb = u.sid
       // Record module-level state BEFORE the first acl call so the
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
@@ -1728,11 +1772,13 @@ async function initializeSteps(
       // The egress probe, under the token this session's commands
       // get; anything but a refused connect throws, and so does an
       // install whose loopback mode is not this session's. Remembered
-      // per account and loopback mode.
+      // per account and loopback mode. The open account has no fence
+      // to probe: its commands are the ones with open egress.
       const allowLoopback = runtimeConfig.network?.allowLocalBinding === true
       if (
-        windowsWfpVerifiedFor !== sb ||
-        windowsWfpVerifiedLoopback !== allowLoopback
+        accountRole === 'filtered' &&
+        (windowsWfpVerifiedFor !== sb ||
+          windowsWfpVerifiedLoopback !== allowLoopback)
       ) {
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
@@ -1749,6 +1795,7 @@ async function initializeSteps(
         windowsWfpVerifiedLoopback = allowLoopback
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
+      sessionSandboxAccount = accountRole
     } catch (e) {
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
@@ -1762,6 +1809,18 @@ async function initializeSteps(
       config = undefined
       throw e
     }
+  }
+
+  // The gate: an explicit `enabled: false` starts no proxy and no Linux
+  // bridge, and wrapWithSandbox applies no network restriction. The
+  // filesystem work above is untouched.
+  sessionNetworkDisabled = config.network.enabled === false
+  if (sessionNetworkDisabled) {
+    proxyAuthToken = undefined
+    managerContext = undefined
+    initializationPromise = undefined
+    logForDebugging('Network disabled by config; starting no proxy')
+    return
   }
 
   // Initialize network infrastructure
@@ -1875,6 +1934,21 @@ function isSandboxingEnabled(): boolean {
 }
 
 /**
+ * The network gate. `network.enabled: false` at initialize() is fixed for
+ * the session (there is no proxy to turn back on); a per-command
+ * `customConfig` can also turn the gate off for one call.
+ */
+function isNetworkDisabled(
+  customConfig?: Partial<SandboxRuntimeConfig>,
+): boolean {
+  return (
+    sessionNetworkDisabled ||
+    customConfig?.network?.enabled === false ||
+    config?.network?.enabled === false
+  )
+}
+
+/**
  * Platform-independent part of the dependency check. Returns either
  * a finished result (POSIX, unsupported platform, or a Windows
  * srt-win resolution failure) or the inputs for the Windows probe —
@@ -1889,6 +1963,7 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
         sandboxUser?: string
         srtWin: SrtWinSpawn
         allowLoopback?: boolean
+        needsOpenAccount?: boolean
       }
     } {
   if (!isSupportedPlatform()) {
@@ -1935,6 +2010,8 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
         ...(config && {
           allowLoopback: config.network?.allowLocalBinding === true,
         }),
+        // And a gate-off session needs the open account.
+        ...(config && { needsOpenAccount: config.network?.enabled === false }),
       },
     }
   }
@@ -2493,7 +2570,7 @@ function windowsLoopbackModeChanged(
 }
 
 function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
-  if (!config) {
+  if (!config || isNetworkDisabled()) {
     return {}
   }
 
@@ -2934,15 +3011,20 @@ async function wrapWithSandboxOnce(
     customConfig?.network?.allowedDomains !== undefined ||
     config?.network?.allowedDomains !== undefined
 
+  // The gate: an explicit `enabled: false` turns off the proxy and the
+  // platform network restriction. The filesystem rules gathered above are
+  // unaffected.
+  const networkDisabled = isNetworkDisabled(customConfig)
+
   // Network RESTRICTION is needed whenever network config is specified
   // This includes empty allowedDomains which means "block all network"
-  const needsNetworkRestriction = hasNetworkConfig
+  const needsNetworkRestriction = hasNetworkConfig && !networkDisabled
 
   // Network PROXY is needed whenever network config is specified
   // Even with empty allowedDomains, we route through proxy so that:
   // 1. updateConfig() can enable network access for already-running processes
   // 2. The proxy blocks all requests when allowlist is empty
-  const needsNetworkProxy = hasNetworkConfig
+  const needsNetworkProxy = hasNetworkConfig && !networkDisabled
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
@@ -3119,9 +3201,13 @@ async function wrapWithSandboxArgv(
           'SandboxManager.spawnSandboxed() instead of wrapWithSandboxArgv().',
       )
     }
+    // The gate: an explicit `enabled: false` passes no proxy, so the
+    // command runs without the network restriction. Filesystem denies
+    // below still apply.
     const hasNetworkConfig =
-      customConfig?.network?.allowedDomains !== undefined ||
-      config?.network?.allowedDomains !== undefined
+      !isNetworkDisabled(customConfig) &&
+      (customConfig?.network?.allowedDomains !== undefined ||
+        config?.network?.allowedDomains !== undefined)
     if (hasNetworkConfig) {
       await waitForNetworkInitialization()
     }
@@ -3218,10 +3304,12 @@ async function wrapWithSandboxArgv(
     )
     // The loopback mode is the one initialize() probed the fence with.
     // A command or an updateConfig() asking for the other is refused here.
+    // The open account has no fence, so there is no mode to match.
     const wantsLoopback =
       (customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()) ===
       true
     if (
+      sessionSandboxAccount === 'filtered' &&
       windowsWfpVerifiedLoopback !== undefined &&
       wantsLoopback !== windowsWfpVerifiedLoopback
     ) {
@@ -3239,7 +3327,11 @@ async function wrapWithSandboxArgv(
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
       // `srt-win exec` launches nothing unless this is the loopback mode
       // the install recorded: a difference is refused, never ignored.
+      // The open account has no recorded mode of its own.
       allowLoopback: wantsLoopback,
+      // The account chosen at initialize(): a gate-off session runs as
+      // the open one, whose SID this session's ACEs are stamped on.
+      openAccount: sessionSandboxAccount === 'open',
       // mode:'deny' env vars are structurally absent (fresh
       // srt-sandbox profile env). mode:'mask' sentinels are
       // passed via the --env overlay so the sandboxed child sees
@@ -3405,9 +3497,12 @@ async function spawnSandboxed(
   if (customConfig?.network?.allowLocalBinding === true) {
     assertMxcSessionConfig({ network: customConfig.network })
   }
+  // The gate: no proxy is passed when network is disabled, and every
+  // filesystem rule below still applies.
   const hasNetworkConfig =
-    customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+    !isNetworkDisabled(customConfig) &&
+    (customConfig?.network?.allowedDomains !== undefined ||
+      config?.network?.allowedDomains !== undefined)
   if (hasNetworkConfig) {
     await waitForNetworkInitialization()
   }
@@ -3456,6 +3551,7 @@ async function spawnSandboxed(
   const request = buildMxcRequest({
     command,
     commandId: options.commandId,
+    networkEnabled: !isNetworkDisabled(customConfig),
     httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
     socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
     proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
@@ -3523,6 +3619,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   const nextLoopback = newConfig.network?.allowLocalBinding === true
   if (
     getPlatform() === 'windows' &&
+    sessionSandboxAccount === 'filtered' &&
     config &&
     windowsWfpVerifiedLoopback !== undefined &&
     nextLoopback !== windowsWfpVerifiedLoopback
@@ -3697,6 +3794,7 @@ async function reset(): Promise<void> {
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  sessionSandboxAccount = 'filtered'
   srtWinSpawn = undefined
   windowsProfileRead = undefined
   windowsProfileReadWarnings = []
@@ -3800,6 +3898,7 @@ async function reset(): Promise<void> {
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
+  sessionNetworkDisabled = false
   parentProxy = undefined
   resolvedAddressGuard = createResolvedAddressGuard()
   mitmCA = undefined

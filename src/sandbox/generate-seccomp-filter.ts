@@ -16,7 +16,7 @@ const NPM_ROOT_COMMAND = 'npm root -g'
 const NPM_ROOT_TIMEOUT_MS = 5000
 
 /**
- * Get paths to check for globally installed @anthropic-ai/sandbox-runtime package.
+ * Get paths to check for globally installed @ahpio/sandbox-runtime package.
  * This is used as a fallback when the binaries aren't bundled (e.g., native builds).
  *
  * Blocks the event loop on `npm root -g` (~100 ms) the first time it is
@@ -79,46 +79,32 @@ function buildGlobalNpmPaths(npmRootOutput: string | undefined): string[] {
   // The actual global npm root, when npm answered
   const npmRoot = npmRootOutput?.trim()
   if (npmRoot) {
-    paths.push(join(npmRoot, '@anthropic-ai', 'sandbox-runtime'))
+    paths.push(join(npmRoot, '@ahpio', 'sandbox-runtime'))
   }
 
   // Common global npm locations as fallbacks
   const home = homedir()
   paths.push(
     // npm global (Linux/macOS)
-    join('/usr', 'lib', 'node_modules', '@anthropic-ai', 'sandbox-runtime'),
-    join(
-      '/usr',
-      'local',
-      'lib',
-      'node_modules',
-      '@anthropic-ai',
-      'sandbox-runtime',
-    ),
+    join('/usr', 'lib', 'node_modules', '@ahpio', 'sandbox-runtime'),
+    join('/usr', 'local', 'lib', 'node_modules', '@ahpio', 'sandbox-runtime'),
     // npm global with prefix (common on macOS with homebrew)
     join(
       '/opt',
       'homebrew',
       'lib',
       'node_modules',
-      '@anthropic-ai',
+      '@ahpio',
       'sandbox-runtime',
     ),
     // User-local npm global
-    join(
-      home,
-      '.npm',
-      'lib',
-      'node_modules',
-      '@anthropic-ai',
-      'sandbox-runtime',
-    ),
+    join(home, '.npm', 'lib', 'node_modules', '@ahpio', 'sandbox-runtime'),
     join(
       home,
       '.npm-global',
       'lib',
       'node_modules',
-      '@anthropic-ai',
+      '@ahpio',
       'sandbox-runtime',
     ),
   )

@@ -916,7 +916,7 @@ describe('WINDOWS_INSTALL_COMMAND (pure, all platforms)', () => {
 
   it('is the only spelling in src/ and the README', () => {
     const otherSpelling =
-      /npx\s+(-\S+\s+)*sandbox-runtime|(?<!@anthropic-ai\/)sandbox-runtime\s+windows-/
+      /npx\s+(-\S+\s+)*sandbox-runtime|(?<!@ahpio\/)sandbox-runtime\s+windows-/
     const sources = fs
       .readdirSync(join(repoRoot, 'src'), { recursive: true, encoding: 'utf8' })
       .filter(file => file.endsWith('.ts'))
@@ -3118,7 +3118,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(sync.errors[0]).toMatch(/setup version 2; this release needs 3/)
     expect(sync.errors[0]).toMatch(/Re-run the install to upgrade it in place/)
     expect(sync.errors[0]).toContain(
-      'npx @anthropic-ai/sandbox-runtime windows-install',
+      'npx @ahpio/sandbox-runtime windows-install',
     )
     expect(sync.errors[0]).not.toMatch(/not provisioned|one-time install/i)
     spawnSpy.mockRestore()
@@ -3815,7 +3815,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
     expect((err as WindowsSandboxError).message).toContain(hint)
     expect((err as WindowsSandboxError).message).toContain(
-      'npx @anthropic-ai/sandbox-runtime windows-install --allow-loopback --force',
+      'npx @ahpio/sandbox-runtime windows-install --allow-loopback --force',
     )
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
@@ -3832,7 +3832,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     ).catch(e => e as WindowsSandboxError)
     expect((closed as WindowsSandboxError).code).toBe('wfp_loopback_mismatch')
     expect((closed as WindowsSandboxError).message).toContain(
-      '`npx @anthropic-ai/sandbox-runtime windows-install --force`',
+      '`npx @ahpio/sandbox-runtime windows-install --force`',
     )
   })
 
@@ -4246,7 +4246,7 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
         expect(e.message).toMatch(/setup version 2; this release needs 3/)
         expect(e.message).toMatch(/Re-run the install/)
         expect(e.message).toContain(
-          'npx @anthropic-ai/sandbox-runtime windows-install',
+          'npx @ahpio/sandbox-runtime windows-install',
         )
         expect(e.message).not.toMatch(/not provisioned|one-time install/i)
         expect(subs()).toEqual([])
@@ -4730,8 +4730,15 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.user.inSandboxGroup).toBe(true)
       expect(r.user.credPresent).toBe(true)
       // Keep in sync with SETUP_VERSION (vendor/srt-win-src/src/install.rs).
-      expect(r.user.markerVersion).toBe(3)
-      expect(r.user.setupVersion).toBe(3)
+      expect(r.user.markerVersion).toBe(4)
+      expect(r.user.setupVersion).toBe(4)
+      // The second account: what a session with the gate off runs as.
+      expect(r.user.openAccountSupported).toBe(true)
+      expect(r.user.openProvisioned).toBe(true)
+      expect(r.user.openSid).toMatch(/^S-1-5-21-/)
+      expect(r.user.openSid).not.toBe(r.user.sid)
+      expect(r.user.openCredPresent).toBe(true)
+      expect(r.user.openMarkerUserSid).toBe(r.user.openSid)
       expect(r.wfp.userSid).toBe(r.user.sid)
       // Combined `srt-win status` returns the same objects the two
       // per-noun calls do (one spawn instead of two).
@@ -4767,6 +4774,8 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     const u = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
     expect(u.provisioned).toBe(false)
     expect(u.credPresent).toBe(false)
+    expect(u.openProvisioned).toBe(false)
+    expect(u.openCredPresent).toBe(false)
     expect(u.markerVersion).toBeUndefined()
   })
 

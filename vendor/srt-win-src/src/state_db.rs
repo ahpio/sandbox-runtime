@@ -1368,14 +1368,14 @@ impl Locked {
     }
 
     /// Release this holder's `(canon, kind)` hold — see
-    /// [`release_hold`].
+    /// [`release_hold_sids`].
     fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
-        release_hold(
+        release_hold_sids(
             &self.conn,
             Some(self.holder_pid.0 as i64),
             canon,
             kind,
-            sandbox_sid,
+            &[sandbox_sid],
             &DISK,
             false,
         )
@@ -1652,13 +1652,15 @@ fn delete_holder(conn: &Connection, holder: Option<i64>, canon: &str, kind: &str
 
 /// Release `holder`'s hold on `(canon, kind)` (`None`: a holderless
 /// row). Where the ACE is now is established before any row changes,
-/// and the row changes commit only after the converge succeeded.
-fn release_hold(
+/// and the row changes commit only after the converge succeeded. The
+/// converge runs for every sandbox account: a path may carry a
+/// session ACE for the filtered account and for the open one.
+fn release_hold_sids(
     conn: &Connection,
     holder: Option<i64>,
     canon: &str,
     kind: &str,
-    sandbox_sid: &str,
+    sandbox_sids: &[&str],
     disk: &Disk,
     force: bool,
 ) -> Result<AceRelease> {
@@ -1732,7 +1734,9 @@ fn release_hold(
     };
     let out = match site {
         Site::Here => {
-            (disk.converge)(&tx, canon, sandbox_sid)?;
+            for sid in sandbox_sids {
+                (disk.converge)(&tx, canon, sid)?;
+            }
             match new_eff {
                 Some(e) if e.as_str() == stored => AceRelease::StillHeld,
                 Some(_) => AceRelease::Downgraded,
@@ -1744,7 +1748,9 @@ fn release_hold(
                 "srt-win: grant '{canon}': file_id moved to '{at}'; \
                  revoking there"
             );
-            (disk.converge)(&tx, &at, sandbox_sid)?;
+            for sid in sandbox_sids {
+                (disk.converge)(&tx, &at, sid)?;
+            }
             AceRelease::Relocated { moved_to: at }
         }
         Site::Gone => {
@@ -1775,13 +1781,33 @@ fn release_hold(
     Ok(out)
 }
 
+/// The single-account form the tests drive directly.
+#[cfg(test)]
+fn release_hold(
+    conn: &Connection,
+    holder: Option<i64>,
+    canon: &str,
+    kind: &str,
+    sandbox_sid: &str,
+    disk: &Disk,
+    force: bool,
+) -> Result<AceRelease> {
+    release_hold_sids(conn, holder, canon, kind, &[sandbox_sid], disk, force)
+}
+
 /// Release the holds of dead brokers, then prune them. Each hold is
-/// its own transaction ([`release_hold`]).
+/// its own transaction ([`release_hold_sids`]).
 fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
     // Identity comes from the validated machine-store read, never
     // from raw rows: the session DB is user-writable.
-    let sb = crate::install::read_setup()?.map(|s| s.sandbox_user_sid);
-    let report = recover_with(conn, sb.as_deref(), &DISK, force)?;
+    let setup = crate::install::read_setup()?;
+    let mut sids: Vec<String> = Vec::new();
+    if let Some(s) = &setup {
+        sids.push(s.sandbox_user_sid.clone());
+        sids.extend(s.sandbox_open_user_sid.clone());
+    }
+    let refs: Vec<&str> = sids.iter().map(String::as_str).collect();
+    let report = recover_with_sids(conn, &refs, &DISK, force)?;
     // Persistent-grant DACL writes that were started and not seen to
     // finish (they have no holder, so nothing above covers them).
     crate::persist::replay_pending(conn);
@@ -1791,7 +1817,7 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
 /// What one recovery pass releases with.
 struct Recovery<'a> {
     conn: &'a Connection,
-    sb: &'a str,
+    sids: &'a [&'a str],
     disk: &'a Disk,
     force: bool,
 }
@@ -1805,7 +1831,15 @@ fn recover_one(
     kind: &str,
     report: &mut RecoveryReport,
 ) -> bool {
-    let done = match release_hold(rc.conn, holder, canon, kind, rc.sb, rc.disk, rc.force) {
+    let done = match release_hold_sids(
+        rc.conn,
+        holder,
+        canon,
+        kind,
+        rc.sids,
+        rc.disk,
+        rc.force,
+    ) {
         Ok(r) if r.is_pending() => false,
         Ok(AceRelease::Dropped) => {
             report.grants_dropped.push(canon.to_string());
@@ -1861,9 +1895,9 @@ fn recover_holds(
     }
 }
 
-fn recover_with(
+fn recover_with_sids(
     conn: &Connection,
-    sb: Option<&str>,
+    sids: &[&str],
     disk: &Disk,
     force: bool,
 ) -> Result<RecoveryReport> {
@@ -1892,10 +1926,10 @@ fn recover_with(
             params![pid],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        if let Some(sb) = sb {
+        if !sids.is_empty() {
             let rc = Recovery {
                 conn,
-                sb,
+                sids,
                 disk,
                 force,
             };
@@ -1917,7 +1951,7 @@ fn recover_with(
 
     // 3. Holderless `working_aces` rows: their deny rows are kept
     //    while ANY grant is still pending.
-    if let Some(sb) = sb {
+    if !sids.is_empty() {
         let orphans: Vec<(String, String)> = query_vec(
             conn,
             "SELECT g.canonical_path, g.kind \
@@ -1933,13 +1967,27 @@ fn recover_with(
         let blocked = !report.grants_pending.is_empty();
         let rc = Recovery {
             conn,
-            sb,
+            sids,
             disk,
             force,
         };
         recover_holds(&rc, None, &orphans, blocked, &mut report);
     }
     Ok(report)
+}
+
+/// The single-account form the tests drive directly.
+#[cfg(test)]
+fn recover_with(
+    conn: &Connection,
+    sb: Option<&str>,
+    disk: &Disk,
+    force: bool,
+) -> Result<RecoveryReport> {
+    match sb {
+        Some(sid) => recover_with_sids(conn, &[sid], disk, force),
+        None => recover_with_sids(conn, &[], disk, force),
+    }
 }
 
 enum IdGate {

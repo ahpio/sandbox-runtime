@@ -1404,6 +1404,9 @@ pub struct PersistentTrustees<'a> {
     /// The sandbox user. A session's allow for it may precede our deny
     /// ([`persistent_layout_ok`]).
     pub sandbox_user_sid: Option<&'a str>,
+    /// The open account, which gate-off sessions run as: the same
+    /// exception as `sandbox_user_sid` for them.
+    pub sandbox_open_user_sid: Option<&'a str>,
     /// The DENY entries the record lists for the path: those wanted now and
     /// those of the last write. `None`: no record, so a deny is told by its
     /// mask ([`product_deny_shape`]).
@@ -1647,7 +1650,10 @@ pub fn persistent_layout_ok(aces: &[AceView], t: &PersistentTrustees<'_>) -> boo
         }
         // A session's allow for the sandbox user ahead of our deny is
         // the one order the product defines that way itself.
-        if !a.deny && t.sandbox_user_sid == Some(a.sid.as_str()) {
+        if !a.deny
+            && (t.sandbox_user_sid == Some(a.sid.as_str())
+                || t.sandbox_open_user_sid == Some(a.sid.as_str()))
+        {
             continue;
         }
         seen_allow |= !a.deny;
@@ -1776,6 +1782,7 @@ mod tests {
         real_user_sid: REAL,
         previous_group_sids: &[],
         sandbox_user_sid: None,
+        sandbox_open_user_sid: None,
         recorded_denies: None,
     };
 
@@ -1977,6 +1984,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             recorded_denies: None,
         };
         let dir = std::env::temp_dir().join(format!("srtwin-persist-{}", std::process::id()));
@@ -2138,6 +2146,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             recorded_denies: None,
         };
         let cap = crate::persist::new_capability_sid().unwrap();
@@ -2253,6 +2262,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             recorded_denies: None,
         };
         let cap = crate::persist::new_capability_sid().unwrap();
@@ -2394,6 +2404,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: Some(SB),
+            sandbox_open_user_sid: None,
             recorded_denies: None,
         };
         let exclusion = persistent_aces(&PersistentWant {
@@ -2517,11 +2528,13 @@ mod tests {
             real_user_sid: "S-1-5-21-9-9-9-500",
             previous_group_sids: &previous,
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             recorded_denies: None,
         };
         let without = PersistentTrustees {
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             ..with
         };
         for deny in [false, true] {
@@ -2784,6 +2797,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             recorded_denies: Some(&[]),
         };
         let (how, walks, _) = counted(&|| write_persistent_aces(path, &t, &want).unwrap());
@@ -2971,6 +2985,7 @@ mod tests {
             real_user_sid: &real,
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             recorded_denies: None,
         };
         let want = persistent_aces(&PersistentWant {

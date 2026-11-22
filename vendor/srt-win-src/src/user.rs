@@ -47,9 +47,21 @@ use crate::{sam, sid};
 /// ([`crate::install::read_setup`]).
 pub const SANDBOX_USER: &str = "srt-sandbox";
 
-/// Local group that holds [`SANDBOX_USER`]. Trustee for the
-/// credential-file DENY ACE.
+/// Local group that holds [`SANDBOX_USER`] and [`SANDBOX_OPEN_USER`].
+/// Trustee for the credential-file DENY ACE.
 pub const SANDBOX_GROUP: &str = "sandbox-runtime-users";
+
+/// Default name for the second local account: the one a session with
+/// `network.enabled: false` runs as. It gets the same group, ACLs and
+/// profile handling as [`SANDBOX_USER`], and no WFP filters of its own
+/// — the filters key on one SID, and that is the filtered account's.
+pub const SANDBOX_OPEN_USER: &str = "srt-sandbox-open";
+
+/// The open account that pairs with a filtered account named `name`.
+/// The default name yields [`SANDBOX_OPEN_USER`].
+pub fn open_account_name(name: &str) -> String {
+    format!("{name}-open")
+}
 
 /// Result of [`provision`] — the password is returned in clear so
 /// the caller can DPAPI-encrypt and persist it; it is not stored
@@ -610,6 +622,12 @@ pub fn remove_logon_denials(group_sid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_open_account_name_is_the_constant() {
+        assert_eq!(open_account_name(SANDBOX_USER), SANDBOX_OPEN_USER);
+        assert_eq!(open_account_name("custom"), "custom-open");
+    }
 
     #[test]
     fn password_shape() {

@@ -408,6 +408,29 @@ export interface WindowsSandboxUserStatus {
    * runs in, when `srt-win` can tell.
    */
   sessionUserSid?: string
+  /**
+   * This `srt-win` reports the open sandbox account at all. False from
+   * a build that predates it: such a build cannot run a session with
+   * `network.enabled: false`, and the install has to be redone with
+   * one that can.
+   */
+  openAccountSupported?: boolean
+  /**
+   * The open account (`<sandbox-user>-open`) exists. It is the
+   * account a session with `network.enabled: false` runs as: the same
+   * group, ACLs and profile handling as {@link provisioned}, and no
+   * WFP filter keyed on its SID.
+   */
+  openProvisioned?: boolean
+  /** `S-1-5-21-…` of the open account, when provisioned. */
+  openSid?: string
+  /** The open account's credential blob is present and readable. */
+  openCredPresent?: boolean
+  /**
+   * The open account SID the install record names. Absent from an
+   * install made before the account existed.
+   */
+  openMarkerUserSid?: string
 }
 
 /**
@@ -556,6 +579,20 @@ export interface WindowsSandboxParams {
    * true, with a proxy, `no_proxy` names the loopback hosts.
    */
   allowLoopback?: boolean
+  /**
+   * Run the command as the open account (`<sandbox-user>-open`)
+   * instead of the filtered one. A session with
+   * `network.enabled: false` passes this: no WFP filter is keyed on
+   * the open account's SID, so the command's egress is unrestricted,
+   * and the session's filesystem grants and denies are stamped on it
+   * instead (see {@link WindowsSandboxAccountRole}).
+   *
+   * `--allow-loopback` and the `no_proxy` overlay are not emitted
+   * with it: the loopback mode is a property of the filtered
+   * account's filters, and `srt-win` does not check it for the open
+   * account.
+   */
+  openAccount?: boolean
   /**
    * `mode: 'mask'` credential env vars — sentinel values the
    * sandboxed child should see in place of the real credentials.
@@ -1118,20 +1155,31 @@ function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
   }
 }
 
+/** One sandbox account's row, from `srt-win user status`. */
+type RawSandboxUser = {
+  exists: boolean
+  sid?: string
+  group_exists: boolean
+  group_sid?: string
+  in_builtin_users: boolean
+  in_sandbox_group: boolean
+  hidden_from_logon: boolean
+}
+
 /** Shape of `srt-win user status` (and `srt-win status .user`) stdout. */
 type RawUserStatus = {
-  user: {
-    exists: boolean
-    sid?: string
-    group_exists: boolean
-    group_sid?: string
-    in_builtin_users: boolean
-    in_sandbox_group: boolean
-    hidden_from_logon: boolean
-  }
+  user: RawSandboxUser
   cred_present: boolean
   marker_version?: number | null
   setup_version?: number | null
+  /**
+   * The second account, and its own credential. All four are absent
+   * from an `srt-win` that predates the open account.
+   */
+  open_account_supported?: boolean
+  open_user?: RawSandboxUser
+  open_cred_present?: boolean
+  open_marker_user_sid?: string | null
   real_user_sid: string
   ca_cert_thumb?: string | null
   ca_cert_pem?: string | null
@@ -1234,6 +1282,7 @@ const SECLOGON_STATES: readonly string[] = [
 ] satisfies WindowsSeclogonState[]
 
 function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
+  const open = raw.open_user
   return {
     provisioned: raw.user.exists,
     ...(raw.user.sid && { sid: raw.user.sid }),
@@ -1273,6 +1322,14 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
       raw.session_user_sid !== '' && {
         sessionUserSid: raw.session_user_sid,
       }),
+    openAccountSupported: raw.open_account_supported === true,
+    openProvisioned: open?.exists === true,
+    ...(open?.sid && { openSid: open.sid }),
+    openCredPresent: raw.open_cred_present === true,
+    ...(typeof raw.open_marker_user_sid === 'string' &&
+      raw.open_marker_user_sid !== '' && {
+        openMarkerUserSid: raw.open_marker_user_sid,
+      }),
     capabilities: capabilityList(raw.capabilities),
     // As above: only an explicit "none" is no grant.
     ...(raw.profile_grant &&
@@ -1285,6 +1342,29 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
         },
       }),
   }
+}
+
+/**
+ * Which sandbox account a session's commands run as. `filtered` is
+ * `srt-sandbox`, with the WFP egress fence keyed on its SID; `open` is
+ * `srt-sandbox-open`, which has no filter of its own.
+ */
+export type WindowsSandboxAccountRole = 'filtered' | 'open'
+
+/**
+ * The account a session runs as, from its `network.enabled`. A session
+ * with the gate off runs as the open account: no WFP filter is keyed
+ * on it, so its egress is unrestricted. Every other session, and one
+ * that does not say, runs as the filtered account.
+ *
+ * The filesystem rules do not depend on the choice: both accounts are
+ * in the same group (persistent grants key on it) and the session's
+ * own ACEs are stamped on the account the commands run as.
+ */
+export function windowsSandboxAccountRole(
+  networkEnabled: boolean | undefined,
+): WindowsSandboxAccountRole {
+  return networkEnabled === false ? 'open' : 'filtered'
 }
 
 /** User-facing text for a disabled/absent Secondary Logon service. */
@@ -1417,6 +1497,13 @@ export interface WindowsInstallContext {
   proxyPortRange?: readonly [number, number]
   sandboxUser?: string
   allowLoopback?: boolean
+  /**
+   * The session's network gate is off, so its commands run as the
+   * open account; an install without one has to be redone. Read by
+   * {@link checkWindowsDependencies} / `...Async`; the install
+   * command itself does not take it.
+   */
+  needsOpenAccount?: boolean
 }
 
 /**
@@ -1443,7 +1530,7 @@ function windowsInstallFlags(
 
 /** The install command, as error messages print it. */
 export const WINDOWS_INSTALL_COMMAND =
-  'npx @anthropic-ai/sandbox-runtime windows-install'
+  'npx @ahpio/sandbox-runtime windows-install'
 
 function windowsInstallCommand(
   ctx: WindowsInstallContext,
@@ -4411,7 +4498,12 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   delete generated.no_proxy
   // With loopback open the fence permits direct loopback connects, so the
   // loopback hosts (only: private networks are still fenced) skip the proxy.
-  if (p.allowLoopback && (p.httpProxyPort || p.socksProxyPort)) {
+  // The open account has no fence and no proxy: nothing to route around.
+  if (
+    !p.openAccount &&
+    p.allowLoopback &&
+    (p.httpProxyPort || p.socksProxyPort)
+  ) {
     generated.no_proxy = WINDOWS_LOOPBACK_NO_PROXY
   }
 
@@ -4436,7 +4528,11 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   if (p.heldBy !== undefined) argv.push('--held-by', `${p.heldBy}`)
   argv.push('--write-restricted-token')
   for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
-  if (p.allowLoopback) argv.push('--allow-loopback')
+  // The open account has no filters of its own, so there is no
+  // recorded loopback mode to match: `srt-win` neither wants nor
+  // checks `--allow-loopback` for it.
+  if (p.openAccount) argv.push('--open-account')
+  else if (p.allowLoopback) argv.push('--allow-loopback')
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const a of p.denyReadExcept ?? []) argv.push('--deny-read-except', a)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
@@ -4593,6 +4689,33 @@ export function windowsSetupVersionMismatch(
   )
 }
 
+/**
+ * Why a session with `network.enabled: false` cannot run on this
+ * install, or `undefined`. Such a session runs as the open account,
+ * and neither an `srt-win` that predates that account nor an install
+ * made before it has one. Nothing falls back to the filtered account
+ * (whose filters would break the session) or to the real user.
+ */
+export function windowsOpenAccountMismatch(
+  us: WindowsSandboxUserStatus,
+  install: WindowsInstallContext = {},
+): string | undefined {
+  const why = !us.openAccountSupported
+    ? `The srt-win in use predates the open sandbox account`
+    : !us.openProvisioned || !us.openSid
+      ? `The open sandbox account is not provisioned on this machine`
+      : !us.openCredPresent
+        ? `The open sandbox account's credential is not readable`
+        : undefined
+  if (why === undefined) return undefined
+  return (
+    `${why}, and a session with network.enabled: false runs as it. ` +
+    `Re-run the install to add it (one UAC prompt):\n` +
+    windowsInstallCommandLines(windowsInstallFlags(install, false)) +
+    `Nothing is run until then.`
+  )
+}
+
 /** The two ways to run the install, with `flags` (see `windowsInstallFlags`). */
 function windowsInstallCommandLines(flags: string): string {
   return (
@@ -4670,6 +4793,11 @@ function interpretDependencyProbes(
     // Installed, by a release with another setup version: an upgrade,
     // not a missing sandbox, so its own wording.
     reinstallRequired = windowsSetupVersionMismatch(us, sublayerGuid)
+    // A gate-off session runs as the open account and has no other
+    // one to fall back to.
+    if (!reinstallRequired && install.needsOpenAccount) {
+      reinstallRequired = windowsOpenAccountMismatch(us, install)
+    }
     if (reinstallRequired) errors.push(reinstallRequired)
   }
 
@@ -4734,6 +4862,8 @@ function interpretDependencyProbes(
     (ws.state === 'installed' || ws.state === 'cannot-read')
   if (
     fenced &&
+    // The open account has no filters, so no mode of its own to match.
+    !install.needsOpenAccount &&
     allowLoopback !== undefined &&
     ws.allowLoopback !== allowLoopback
   ) {

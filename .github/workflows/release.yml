@@ -1143,12 +1143,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify release tag is on main
+      - name: Verify release tag is on ahpio
         if: github.event_name == 'release'
         run: |
-          git fetch origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Release tag points to a commit not on main. Refusing to publish unreviewed code."
+          git fetch origin ahpio
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/ahpio; then
+            echo "::error::Release tag points to a commit not on ahpio. Refusing to publish unreviewed code."
             exit 1
           fi
 
@@ -1548,7 +1548,7 @@ jobs:
           # vendor/srt-win/<arch>/srt-win.exe under node_modules and runs it.
           Set-Content -Path verify.cjs -Value @"
           const { spawnSync } = require('child_process');
-          import('@anthropic-ai/sandbox-runtime').then(m => {
+          import('@ahpio/sandbox-runtime').then(m => {
             const p = m.getSrtWinPath();
             console.log('resolved:', p);
             const r = spawnSync(p, ['--version'], { encoding: 'utf8' });
@@ -1837,4 +1837,12 @@ jobs:
         with:
           name: package
       # Trusted publishing attaches provenance without --provenance.
-      - run: npm publish ./*.tgz --access public
+      # A prerelease (a tag with a hyphen, e.g. v0.0.83-rc.0) publishes
+      # under npm's next tag, so latest stays on a stable release.
+      - run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" == *-* ]]; then
+            npm publish ./*.tgz --access public --tag next
+          else
+            npm publish ./*.tgz --access public
+          fi

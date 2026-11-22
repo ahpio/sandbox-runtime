@@ -1,0 +1,10 @@
+sandbox-runtime
+
+This product includes software developed at Anthropic PBC (https://github.com/anthropics/sandbox-runtime) and licensed under the Apache License, Version 2.0.
+
+The fork published as @ahpio/sandbox-runtime changes that software in two ways:
+
+1. It adds the `network.enabled` setting. When it is false, the runtime starts no proxy, allows every network request, and applies no network restriction, while every filesystem rule still applies.
+2. It widens the `zod` dependency range to `^3.25.0 || ^4.6.6`.
+
+The remaining code is that of upstream v0.0.83.

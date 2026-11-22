@@ -92,7 +92,7 @@ describe('getJavaProxyAgentJarPathAsync', () => {
     const asyncPaths = await getGlobalNpmPathsAsync()
     expect(getGlobalNpmPaths()).toBe(asyncPaths)
     expect(asyncPaths).toContain(
-      join('/usr', 'lib', 'node_modules', '@anthropic-ai', 'sandbox-runtime'),
+      join('/usr', 'lib', 'node_modules', '@ahpio', 'sandbox-runtime'),
     )
   })
 

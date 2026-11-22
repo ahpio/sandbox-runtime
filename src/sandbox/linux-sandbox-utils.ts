@@ -3624,7 +3624,7 @@ export async function wrapCommandWithSandboxLinux(
       if (!applySeccompPrefix) {
         logForDebugging(
           '[Sandbox Linux] apply-seccomp binary not available - unix socket blocking disabled. ' +
-            'Install @anthropic-ai/sandbox-runtime globally for full protection.',
+            'Install @ahpio/sandbox-runtime globally for full protection.',
           { level: 'warn' },
         )
       } else {
