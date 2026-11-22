@@ -3118,7 +3118,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(sync.errors[0]).toMatch(/setup version 2; this release needs 3/)
     expect(sync.errors[0]).toMatch(/Re-run the install to upgrade it in place/)
     expect(sync.errors[0]).toContain(
-      'npx @anthropic-ai/sandbox-runtime windows-install',
+      'npx @ahpio/sandbox-runtime windows-install',
     )
     expect(sync.errors[0]).not.toMatch(/not provisioned|one-time install/i)
     spawnSpy.mockRestore()
@@ -3815,7 +3815,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
     expect((err as WindowsSandboxError).message).toContain(hint)
     expect((err as WindowsSandboxError).message).toContain(
-      'npx @anthropic-ai/sandbox-runtime windows-install --allow-loopback --force',
+      'npx @ahpio/sandbox-runtime windows-install --allow-loopback --force',
     )
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
@@ -3832,7 +3832,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     ).catch(e => e as WindowsSandboxError)
     expect((closed as WindowsSandboxError).code).toBe('wfp_loopback_mismatch')
     expect((closed as WindowsSandboxError).message).toContain(
-      '`npx @anthropic-ai/sandbox-runtime windows-install --force`',
+      '`npx @ahpio/sandbox-runtime windows-install --force`',
     )
   })
 
@@ -4246,7 +4246,7 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
         expect(e.message).toMatch(/setup version 2; this release needs 3/)
         expect(e.message).toMatch(/Re-run the install/)
         expect(e.message).toContain(
-          'npx @anthropic-ai/sandbox-runtime windows-install',
+          'npx @ahpio/sandbox-runtime windows-install',
         )
         expect(e.message).not.toMatch(/not provisioned|one-time install/i)
         expect(subs()).toEqual([])

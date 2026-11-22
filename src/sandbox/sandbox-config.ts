@@ -675,6 +675,14 @@ export const CredentialsConfigSchema = z
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
+  enabled: z
+    .boolean()
+    .optional()
+    .describe(
+      'Whether the network sandbox is enforced (default: true). When false, ' +
+        'no proxy starts, every request is allowed, and no network ' +
+        'restriction is applied; every filesystem rule still applies.',
+    ),
   allowedDomains: z
     .array(domainPortPatternSchema)
     .describe(

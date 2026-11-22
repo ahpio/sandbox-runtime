@@ -192,6 +192,10 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+// Once initialize() sees `network.enabled: false` no proxy is started, so
+// the gate stays off for the session: updateConfig() cannot turn it back on
+// without a reset() and a new initialize().
+let sessionNetworkDisabled = false
 // The initialize() in flight, from its first step: a profile grant refresh
 // can hold it for minutes before initializationPromise exists. reset()
 // moves the generation on, which cancels it.
@@ -787,6 +791,14 @@ async function filterNetworkRequest(
   if (!config) {
     logForDebugging('No config available, denying network request')
     return denied('sandbox policy unavailable')
+  }
+
+  // The gate: when network is disabled the proxy is not started, but an
+  // external proxy or a port still in use must not apply a policy the
+  // configuration says does not apply.
+  if (config.network.enabled === false) {
+    logForDebugging(`Network disabled; allowing ${host}:${port}`)
+    return true
   }
 
   // Reject hosts containing control characters before pattern matching.
@@ -1431,6 +1443,7 @@ async function initializeSteps(
           // and the probe only needs the policy shape, not a live
           // listener.
           httpProxyPort:
+            runtimeConfig.network.enabled !== false &&
             runtimeConfig.network.allowedDomains !== undefined
               ? DEFAULT_WINDOWS_PROXY_PORT_RANGE[0]
               : undefined,
@@ -1764,6 +1777,18 @@ async function initializeSteps(
     }
   }
 
+  // The gate: an explicit `enabled: false` starts no proxy and no Linux
+  // bridge, and wrapWithSandbox applies no network restriction. The
+  // filesystem work above is untouched.
+  sessionNetworkDisabled = config.network.enabled === false
+  if (sessionNetworkDisabled) {
+    proxyAuthToken = undefined
+    managerContext = undefined
+    initializationPromise = undefined
+    logForDebugging('Network disabled by config; starting no proxy')
+    return
+  }
+
   // Initialize network infrastructure
   initializationPromise = (async () => {
     try {
@@ -1872,6 +1897,21 @@ function isSupportedPlatform(): boolean {
 function isSandboxingEnabled(): boolean {
   // Sandboxing is enabled if config has been set (via initialize())
   return config !== undefined
+}
+
+/**
+ * The network gate. `network.enabled: false` at initialize() is fixed for
+ * the session (there is no proxy to turn back on); a per-command
+ * `customConfig` can also turn the gate off for one call.
+ */
+function isNetworkDisabled(
+  customConfig?: Partial<SandboxRuntimeConfig>,
+): boolean {
+  return (
+    sessionNetworkDisabled ||
+    customConfig?.network?.enabled === false ||
+    config?.network?.enabled === false
+  )
 }
 
 /**
@@ -2493,7 +2533,7 @@ function windowsLoopbackModeChanged(
 }
 
 function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
-  if (!config) {
+  if (!config || isNetworkDisabled()) {
     return {}
   }
 
@@ -2934,15 +2974,20 @@ async function wrapWithSandboxOnce(
     customConfig?.network?.allowedDomains !== undefined ||
     config?.network?.allowedDomains !== undefined
 
+  // The gate: an explicit `enabled: false` turns off the proxy and the
+  // platform network restriction. The filesystem rules gathered above are
+  // unaffected.
+  const networkDisabled = isNetworkDisabled(customConfig)
+
   // Network RESTRICTION is needed whenever network config is specified
   // This includes empty allowedDomains which means "block all network"
-  const needsNetworkRestriction = hasNetworkConfig
+  const needsNetworkRestriction = hasNetworkConfig && !networkDisabled
 
   // Network PROXY is needed whenever network config is specified
   // Even with empty allowedDomains, we route through proxy so that:
   // 1. updateConfig() can enable network access for already-running processes
   // 2. The proxy blocks all requests when allowlist is empty
-  const needsNetworkProxy = hasNetworkConfig
+  const needsNetworkProxy = hasNetworkConfig && !networkDisabled
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
@@ -3119,9 +3164,13 @@ async function wrapWithSandboxArgv(
           'SandboxManager.spawnSandboxed() instead of wrapWithSandboxArgv().',
       )
     }
+    // The gate: an explicit `enabled: false` passes no proxy, so the
+    // command runs without the network restriction. Filesystem denies
+    // below still apply.
     const hasNetworkConfig =
-      customConfig?.network?.allowedDomains !== undefined ||
-      config?.network?.allowedDomains !== undefined
+      !isNetworkDisabled(customConfig) &&
+      (customConfig?.network?.allowedDomains !== undefined ||
+        config?.network?.allowedDomains !== undefined)
     if (hasNetworkConfig) {
       await waitForNetworkInitialization()
     }
@@ -3405,9 +3454,12 @@ async function spawnSandboxed(
   if (customConfig?.network?.allowLocalBinding === true) {
     assertMxcSessionConfig({ network: customConfig.network })
   }
+  // The gate: no proxy is passed when network is disabled, and every
+  // filesystem rule below still applies.
   const hasNetworkConfig =
-    customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+    !isNetworkDisabled(customConfig) &&
+    (customConfig?.network?.allowedDomains !== undefined ||
+      config?.network?.allowedDomains !== undefined)
   if (hasNetworkConfig) {
     await waitForNetworkInitialization()
   }
@@ -3800,6 +3852,7 @@ async function reset(): Promise<void> {
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
+  sessionNetworkDisabled = false
   parentProxy = undefined
   resolvedAddressGuard = createResolvedAddressGuard()
   mitmCA = undefined

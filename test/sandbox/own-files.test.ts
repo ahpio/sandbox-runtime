@@ -110,7 +110,7 @@ describe.skipIf(isWindows)('The library installed under a write path', () => {
   describe('loaded from a project', () => {
     const REPO = join(import.meta.dir, '..', '..')
     const MANIFEST = join(REPO, 'package.json')
-    const NAME = '@anthropic-ai/sandbox-runtime'
+    const NAME = '@ahpio/sandbox-runtime'
 
     /** The source placed by `layout`, its dependencies beside it. */
     function install(layout: typeof npmLayout): { root: string; link: string } {
