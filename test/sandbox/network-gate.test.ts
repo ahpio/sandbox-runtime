@@ -306,11 +306,11 @@ describe.if(isWindows)('network gate on Windows (mxc)', () => {
     const request = requests.at(-1)
     expect(request?.network.egress.default).toBe('allow')
     expect(request?.network.runtimeConfig).toBeUndefined()
-    expect(
-      request?.filesystem.deniedPaths.some(p =>
-        p.toLowerCase().includes('gate-secret'),
-      ),
-    ).toBe(true)
+    // The deny list carries the denied folder itself, as configured:
+    // the gate changes the network stanza and nothing else.
+    expect(request?.filesystem.deniedPaths.map(p => p.toLowerCase())).toContain(
+      secretDir.toLowerCase(),
+    )
   })
 
   it('passes the proxy when enabled is absent (control)', async () => {
@@ -326,6 +326,10 @@ describe.if(isWindows)('network gate on Windows (mxc)', () => {
     const request = requests.at(-1)
     expect(request?.network.egress.default).toBe('deny')
     expect(request?.network.runtimeConfig?.networkProxy).toContain('127.0.0.1')
+    // Same deny the gate-off row asserts: the gate never touches it.
+    expect(request?.filesystem.deniedPaths.map(p => p.toLowerCase())).toContain(
+      secretDir.toLowerCase(),
+    )
   })
 })
 
