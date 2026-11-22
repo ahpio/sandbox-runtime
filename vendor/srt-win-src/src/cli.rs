@@ -259,6 +259,16 @@ enum Cmd {
         /// and the exit code is 19.
         #[arg(long)]
         allow_loopback: bool,
+        /// Run the command as the open account (`<sandbox-user>-open`)
+        /// instead of the filtered one. A session with
+        /// `network.enabled: false` takes this: the open account is in
+        /// the same group, so the same filesystem grants and denies
+        /// reach it, and no WFP filter is keyed on its SID. The
+        /// per-exec ACEs and the runner use its SID; the loopback-mode
+        /// record (a property of the filtered account's filters) is
+        /// not consulted.
+        #[arg(long)]
+        open_account: bool,
         /// Per-exec read-deny: add an additive `(D;OICI;FA;;;<sb>)`
         /// ACE for the sandbox user on `<PATH>` (and a parent
         /// `FILE_DELETE_CHILD` DENY) for the lifetime of this exec
@@ -999,6 +1009,28 @@ fn merge_ace_targets(
     merged
 }
 
+/// The open account's `user status` row. `open_account_supported`
+/// beside it is this build's word that the row exists at all: an older
+/// `srt-win` omits it, and the host must then reinstall before it can
+/// run a gate-off session.
+fn open_user_status_json(
+    setup: Option<&srt_win::install::SetupInfo>,
+) -> anyhow::Result<serde_json::Value> {
+    use srt_win::user;
+    let name = setup
+        .and_then(|s| s.sandbox_open_user.as_deref())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            user::open_account_name(
+                setup
+                    .map(|s| s.sandbox_user.as_str())
+                    .unwrap_or(user::SANDBOX_USER),
+            )
+        });
+    let st = user::status(&name)?;
+    Ok(serde_json::json!(st))
+}
+
 /// Build the `user status` JSON object (sandbox-user provisioning
 /// state + credential/marker/CA rows from `state.db`). Shared by
 /// `user status` and the top-level combined `status`.
@@ -1011,6 +1043,7 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         .map(|s| s.sandbox_user.as_str())
         .unwrap_or(user::SANDBOX_USER);
     let st = user::status(name)?;
+    let open = open_user_status_json(setup.as_ref())?;
     let ca = install::read_ca_cert()?;
     let ca = ca.as_ref();
     Ok(json!({
@@ -1018,11 +1051,19 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // The HKLM Cred\Blob value (a SYSTEM/fleet install must
         // read as present from any user's session).
         "cred_present": setup.is_some() && install::cred_present(),
+        // The second account, which gates-off sessions run as, and
+        // its own credential blob. `open_account_supported` lets an
+        // older srt-win's silence read as "this build cannot".
+        "open_account_supported": true,
+        "open_user": open,
+        "open_cred_present": setup.is_some() && install::open_cred_present(),
         "marker_version": setup.as_ref().map(|s| s.marker_version),
         // An install whose `marker_version` differs must be re-run.
         "setup_version": install::SETUP_VERSION,
         "marker_user_sid": setup.as_ref()
             .map(|s| s.sandbox_user_sid.as_str()),
+        "open_marker_user_sid": setup.as_ref()
+            .and_then(|s| s.sandbox_open_user_sid.as_deref()),
         // The calling (real) user's SID — surfaced for diagnostics.
         "real_user_sid": srt_win::sid::current_user_sid()?,
         "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
@@ -1095,16 +1136,21 @@ fn ambient_status_json() -> anyhow::Result<serde_json::Value> {
     use srt_win::{acl, install};
     // Degrade like user_status_json: a registry read error (beyond
     // not-found) must not abort the whole status document.
-    let sid = install::read_setup()
+    let sids: Vec<String> = install::read_setup()
         .ok()
         .flatten()
-        .map(|s| s.sandbox_user_sid);
+        .map(|s| {
+            let mut v = vec![s.sandbox_user_sid];
+            v.extend(s.sandbox_open_user_sid);
+            v
+        })
+        .unwrap_or_default();
     let mut paths = Vec::new();
     for p in install::ambient_recorded_paths()? {
-        let present = match &sid {
-            Some(sid) => acl::sandbox_deny_present(&p, sid).unwrap_or(false),
-            None => false,
-        };
+        let present = !sids.is_empty()
+            && sids
+                .iter()
+                .all(|sid| acl::sandbox_deny_present(&p, sid).unwrap_or(false));
         paths.push(json!({ "path": p, "present": present }));
     }
     Ok(json!({ "paths": paths }))
@@ -1378,6 +1424,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
             let name = sandbox_user.as_deref().unwrap_or(user::SANDBOX_USER);
+            // The account a gate-off session runs as. It lives beside
+            // the filtered one, in the same group, with the same ACLs
+            // and profile handling, and no filters of its own.
+            let open_name = user::open_account_name(name);
             // Idempotency / conflict pre-check. With a DIFFERENT
             // port-range, loopback mode or sandbox-user name
             // and no --force, refuse
@@ -1443,9 +1493,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // checked last: it reads a DACL per target, so it
                 // only runs once the cheap conjuncts pass.
                 let us = user::status(name)?;
+                let open_us = user::status(&open_name)?;
                 let mv = existing.as_ref().map(|s| s.marker_version);
                 let ambient_ok = || match &existing {
-                    Some(s) => install::ambient_complete(&s.sandbox_user_sid, &ambient_targets),
+                    Some(s) => {
+                        let mut sids = vec![s.sandbox_user_sid.as_str()];
+                        if let Some(open) = s.sandbox_open_user_sid.as_deref() {
+                            sids.push(open);
+                        }
+                        install::ambient_complete(&sids, &ambient_targets)
+                    }
                     None => false,
                 };
                 // The credential is part of completeness: a
@@ -1453,9 +1510,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // marker must fall through and be rewritten rather
                 // than early-outing on "already installed".
                 // So is the loopback mode: the filters and the record must
-                // both have the one asked for.
+                // both have the one asked for. And both accounts and both
+                // credentials: install must add the open account to an
+                // install that was made before it existed.
                 if us.exists
                     && us.in_sandbox_group
+                    && open_us.exists
+                    && open_us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
                     && st.state == "installed"
                     && st.allow_loopback == allow_loopback
@@ -1465,6 +1526,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .unwrap_or(false)
                         == allow_loopback
                     && install::cred_present()
+                    && install::open_cred_present()
                     && ambient_ok()
                 {
                     // Re-assert the logon-type denials BEFORE the
@@ -1517,32 +1579,37 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!(
                     "srt-win: WARNING: replacing install with \
                      sandbox_user='{old}' → '{name}'. The prior \
-                     '{old}' account is NOT deleted (may be \
-                     enterprise-managed) — remove it manually if \
+                     '{old}' and its open account are NOT deleted (may be \
+                     enterprise-managed) — remove them manually if \
                      unused.",
                 );
             }
-            // Sandbox user account + credential file + setup marker
+            // Sandbox user accounts + credential files + setup marker
             // + user-SID-keyed WFP filters. `we_own_it` gates
             // provision()'s create-or-rotate: the DEFAULT name is
             // ours by definition (so a stale/absent marker — e.g.
             // schema-upgrade re-install — still rotates); an
             // EXPLICIT `--sandbox-user` is create-only unless the
-            // marker records that name from a prior install.
+            // marker records that name from a prior install. The open
+            // account follows the same rule, under its derived name.
             let we_own_it =
                 sandbox_user.is_none() || existing.as_ref().is_some_and(|s| s.sandbox_user == name);
-            let pu = match (|| -> anyhow::Result<srt_win::user::ProvisionedUser> {
+            let (pu, open) = match (|| -> anyhow::Result<(srt_win::user::ProvisionedUser, srt_win::user::ProvisionedUser)> {
                 let pu = user::provision(name, we_own_it).context("provision sandbox user")?;
+                // The second provision re-asserts the group, its logon
+                // denials and the Winlogon hide value: all idempotent.
+                let open = user::provision(&open_name, we_own_it)
+                    .context("provision open sandbox user")?;
                 // Machine store BEFORE write_setup: the dir must
                 // exist with its install-owned ACLs before the
-                // credential file is written into it.
+                // credential blobs are written into it.
                 install::provision_machine_store(&pu.group_sid)
                     .context("provision machine state store")?;
-                install::write_setup(&pu)
-                    .context("write sandbox credential + setup marker to state DB")?;
-                Ok(pu)
+                install::write_setup(&pu, &open)
+                    .context("write sandbox credentials + setup marker to state DB")?;
+                Ok((pu, open))
             })() {
-                Ok(pu) => pu,
+                Ok(pair) => pair,
                 Err(e) => {
                     eprintln!("srt-win: error: sandbox user step: {e:#}");
                     std::process::exit(14);
@@ -1556,7 +1623,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // the WFP step so a failure here leaves the install
             // visibly partial (filters absent) rather than
             // marker-complete with the stamps missing.
-            match install::set_ambient_denies(&pu.sid, &ambient_targets) {
+            match install::set_ambient_denies(
+                &[pu.sid.as_str(), open.sid.as_str()],
+                &ambient_targets,
+            ) {
                 Ok(r) if r.applied.is_empty() && !r.failed.is_empty() => {
                     // Every stamp failed — treat as a real install
                     // failure (per-path oddities are best-effort, a
@@ -1626,11 +1696,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             eprintln!(
                 "srt-win: sandbox user '{}' provisioned (sid={}, \
-                 group={} sid={})",
+                 group={} sid={}); open account '{}' (sid={}) has no \
+                 filters",
                 pu.username,
                 pu.sid,
                 srt_win::user::SANDBOX_GROUP,
                 pu.group_sid,
+                open.username,
+                open.sid,
             );
         }
         Cmd::Uninstall {
@@ -1700,7 +1773,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // account's ambient floor along with the account.
                 // The full (account-removing) branch below is what
                 // takes the stamps off.
-                "Sandbox user kept (--keep-user; ambient write-deny stamps kept with it)."
+                "Sandbox users kept (--keep-user; ambient write-deny stamps kept with them)."
             } else {
                 use srt_win::user;
                 // Use the recorded name (may not be the default),
@@ -1720,7 +1793,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // the SID's ACEs are removed while the account still
                 // resolves.
                 if let Some(s) = &recorded {
-                    match srt_win::install::clear_ambient_denies(&s.sandbox_user_sid) {
+                    let mut sids = vec![s.sandbox_user_sid.as_str()];
+                    if let Some(open) = s.sandbox_open_user_sid.as_deref() {
+                        sids.push(open);
+                    }
+                    match srt_win::install::clear_ambient_denies(&sids) {
                         Ok(n) if n > 0 => {
                             eprintln!("srt-win: ambient write-deny removed from {n} system path(s)",)
                         }
@@ -1735,8 +1812,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .map(|s| s.sandbox_user.clone())
                     .unwrap_or_else(|| user::SANDBOX_USER.into());
                 user::deprovision(&name).context("deprovision sandbox user")?;
+                // The open account only when the record names one: on
+                // an older install no such account was created, and a
+                // derived name could belong to someone else. Both
+                // deprovisions tolerate what the first one already
+                // removed (the group and its LSA denials).
+                if let Some(open) = recorded
+                    .as_ref()
+                    .and_then(|s| s.sandbox_open_user.as_deref())
+                {
+                    user::deprovision(open).context("deprovision open sandbox user")?;
+                }
                 srt_win::install::clear_setup().context("clear credential + setup marker")?;
-                "Sandbox user, credential, and setup marker removed."
+                "Sandbox users, credentials, and setup marker removed."
             };
             // Migration: best-effort remove the legacy
             // discriminator group if a prior install left it.
@@ -1785,13 +1873,24 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         } => {
             use srt_win::install;
             let der = read_ca_der(&path)?;
-            let cred = install::read_cred()?;
-            let sb_sid = install::read_setup()?
-                .ok_or_else(|| anyhow!("sandbox user not provisioned"))?
-                .sandbox_user_sid;
-            install::trust_ca(&der, &cred, &sb_sid).map_err(exit_if_seclogon_disabled)?;
+            let setup = install::read_setup()?
+                .ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
+            let filtered = install::read_cred()?;
+            let mut accounts = vec![install::CaAccount {
+                cred: &filtered,
+                sid: &setup.sandbox_user_sid,
+            }];
+            // A gate-off session runs as the open account, so the CA
+            // must be trusted there too. An install from before it has
+            // no open account; trust-ca still succeeds for the filtered
+            // one (a reinstall adds the other).
+            let open = install::read_open_cred().ok();
+            if let (Some(open), Some(sid)) = (&open, setup.sandbox_open_user_sid.as_deref()) {
+                accounts.push(install::CaAccount { cred: open, sid });
+            }
+            install::trust_ca(&der, &accounts).map_err(exit_if_seclogon_disabled)?;
             eprintln!(
-                "srt-win: CA installed into sandbox-user Root \
+                "srt-win: CA installed into sandbox-account Root hives \
                  (thumb={})",
                 der.thumb()?,
             );
@@ -2161,10 +2260,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         return Ok((at, w, f, None));
                     }
                     let ids = persist::Ids::load()?;
-                    if ids.sandbox_user_sid.as_deref() != Some(sandbox_user_sid.as_str()) {
+                    if ids.sandbox_user_sid.as_deref()
+                        != Some(sandbox_user_sid.as_str())
+                        && ids.sandbox_open_user_sid.as_deref()
+                            != Some(sandbox_user_sid.as_str())
+                    {
                         return Err(anyhow!(
-                            "--sandbox-user-sid {sandbox_user_sid} is not the installed \
-                             sandbox user"
+                            "--sandbox-user-sid {sandbox_user_sid} is neither \
+                             the installed sandbox user nor its open account"
                         ));
                     }
                     // A read deny is not carried onto a recorded profile path
@@ -2815,6 +2918,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
             allow_loopback,
+            open_account,
             deny_read,
             deny_read_except,
             held_by,
@@ -2829,11 +2933,25 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
 
             // Credential + setup read happens FIRST so the
             // exit-15 fast-fail (not provisioned / stale cred)
-            // fires before any WFP/ACL work.
-            let (cred, sb_sid) = match install::read_cred().and_then(|c| {
-                let s = install::read_setup()?
-                    .ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
-                Ok((c, s.sandbox_user_sid))
+            // fires before any WFP/ACL work. A gate-off session asks
+            // for the open account; an install that predates it
+            // fails here rather than falling back to the filtered
+            // account (whose filters would break the session) or to
+            // the real user (no sandbox at all).
+            let (cred, sb_sid) = match install::read_setup().and_then(|s| {
+                let s = s.ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
+                if open_account {
+                    let cred = install::read_open_cred()?;
+                    let sid = s.sandbox_open_user_sid.ok_or_else(|| {
+                        anyhow!(
+                            "this install has no open sandbox account — re-run \
+                             `srt-win install` (elevated) to add it"
+                        )
+                    })?;
+                    Ok((cred, sid))
+                } else {
+                    Ok((install::read_cred()?, s.sandbox_user_sid))
+                }
             }) {
                 Ok(v) => v,
                 Err(e) => {
@@ -2902,8 +3020,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 .ok();
 
             // The non-elevated broker cannot enumerate filters; the recorded
-            // loopback mode is what it can check before launching.
-            if let Err(hint) = install::require_allow_loopback(allow_loopback) {
+            // loopback mode is what it can check before launching. It is a
+            // property of the filtered account's filters, so the open
+            // account (no filters) has nothing to match.
+            if !open_account
+                && let Err(hint) = install::require_allow_loopback(allow_loopback)
+            {
                 eprintln!(
                     "{}",
                     json!({ "code": "wfp_loopback_mismatch", "message": hint })

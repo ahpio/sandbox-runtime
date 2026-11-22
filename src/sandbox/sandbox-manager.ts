@@ -85,6 +85,9 @@ import {
   grantWindowsAclPersistent,
   WINDOWS_INSTALL_COMMAND,
   windowsSetupVersionMismatch,
+  windowsOpenAccountMismatch,
+  windowsSandboxAccountRole,
+  type WindowsSandboxAccountRole,
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
   windowsGrantsBeneathDenies,
@@ -196,6 +199,10 @@ let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 // the gate stays off for the session: updateConfig() cannot turn it back on
 // without a reset() and a new initialize().
 let sessionNetworkDisabled = false
+// Windows: which sandbox account this session's commands run as. Fixed
+// at initialize(), like the gate it follows: a session with the gate off
+// runs as the open account. `windowsFsSbUserSid` is that account's SID.
+let sessionSandboxAccount: WindowsSandboxAccountRole = 'filtered'
 // The initialize() in flight, from its first step: a profile grant refresh
 // can hold it for minutes before initializationPromise exists. reset()
 // moves the generation on, which cancels it.
@@ -1475,6 +1482,11 @@ async function initializeSteps(
     const srtWin = srtWinSpawn
     const u = await getWindowsSandboxUserStatusAsync({ srtWin })
     stopIfReset()
+    // The gate: a session with network disabled runs its commands as
+    // the open account, which has no WFP filters keyed on its SID.
+    // Every other session runs as the filtered one. Fixed for the
+    // session, as the gate is.
+    const accountRole = windowsSandboxAccountRole(runtimeConfig.network.enabled)
     if (!u.provisioned || !u.credPresent) {
       config = undefined
       throw new WindowsSandboxError(
@@ -1485,16 +1497,30 @@ async function initializeSteps(
           `provision it.`,
       )
     }
+    const installCtx = {
+      sublayerGuid:
+        runtimeConfig.windows?.sublayerGuid ??
+        runtimeConfig.windows?.wfpSublayerGuid,
+      proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+      sandboxUser: runtimeConfig.windows?.sandboxUser,
+      allowLoopback: runtimeConfig.network?.allowLocalBinding === true,
+    }
     // srt-win refuses to launch on an install of another setup
     // version; checked before anything is granted.
-    const staleSetup = windowsSetupVersionMismatch(
-      u,
-      runtimeConfig.windows?.sublayerGuid ??
-        runtimeConfig.windows?.wfpSublayerGuid,
-    )
+    const staleSetup = windowsSetupVersionMismatch(u, installCtx.sublayerGuid)
     if (staleSetup) {
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
+    }
+    // A gate-off session needs the open account: there is no falling
+    // back to the filtered one (whose filters would break it) or to
+    // the real user (no sandbox at all).
+    if (accountRole === 'open') {
+      const noOpen = windowsOpenAccountMismatch(u, installCtx)
+      if (noOpen) {
+        config = undefined
+        throw new WindowsSandboxError('reinstall_required', noOpen)
+      }
     }
     // initialize() writes the profile read grant only to narrow one
     // already there (windowsProfileGrantRefreshable).
@@ -1706,14 +1732,16 @@ async function initializeSteps(
         : acc.grantRead
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
-      // status` here.
-      if (!u.sid) {
+      // status` here. The open account's row was checked above; this is
+      // its SID, and the session's ACEs are stamped on it.
+      const sb = accountRole === 'open' ? u.openSid : u.sid
+      if (!sb) {
         throw new Error(
-          'sandbox user SID missing from `srt-win user status` ' +
+          (accountRole === 'open' ? 'open sandbox account' : 'sandbox user') +
+            ' SID missing from `srt-win user status` ' +
             '(provisioned but in an inconsistent state)',
         )
       }
-      const sb = u.sid
       // Record module-level state BEFORE the first acl call so the
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
@@ -1744,11 +1772,13 @@ async function initializeSteps(
       // The egress probe, under the token this session's commands
       // get; anything but a refused connect throws, and so does an
       // install whose loopback mode is not this session's. Remembered
-      // per account and loopback mode.
+      // per account and loopback mode. The open account has no fence
+      // to probe: its commands are the ones with open egress.
       const allowLoopback = runtimeConfig.network?.allowLocalBinding === true
       if (
-        windowsWfpVerifiedFor !== sb ||
-        windowsWfpVerifiedLoopback !== allowLoopback
+        accountRole === 'filtered' &&
+        (windowsWfpVerifiedFor !== sb ||
+          windowsWfpVerifiedLoopback !== allowLoopback)
       ) {
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
@@ -1765,6 +1795,7 @@ async function initializeSteps(
         windowsWfpVerifiedLoopback = allowLoopback
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
+      sessionSandboxAccount = accountRole
     } catch (e) {
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
@@ -1932,6 +1963,7 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
         sandboxUser?: string
         srtWin: SrtWinSpawn
         allowLoopback?: boolean
+        needsOpenAccount?: boolean
       }
     } {
   if (!isSupportedPlatform()) {
@@ -1978,6 +2010,8 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
         ...(config && {
           allowLoopback: config.network?.allowLocalBinding === true,
         }),
+        // And a gate-off session needs the open account.
+        ...(config && { needsOpenAccount: config.network?.enabled === false }),
       },
     }
   }
@@ -3270,10 +3304,12 @@ async function wrapWithSandboxArgv(
     )
     // The loopback mode is the one initialize() probed the fence with.
     // A command or an updateConfig() asking for the other is refused here.
+    // The open account has no fence, so there is no mode to match.
     const wantsLoopback =
       (customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()) ===
       true
     if (
+      sessionSandboxAccount === 'filtered' &&
       windowsWfpVerifiedLoopback !== undefined &&
       wantsLoopback !== windowsWfpVerifiedLoopback
     ) {
@@ -3291,7 +3327,11 @@ async function wrapWithSandboxArgv(
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
       // `srt-win exec` launches nothing unless this is the loopback mode
       // the install recorded: a difference is refused, never ignored.
+      // The open account has no recorded mode of its own.
       allowLoopback: wantsLoopback,
+      // The account chosen at initialize(): a gate-off session runs as
+      // the open one, whose SID this session's ACEs are stamped on.
+      openAccount: sessionSandboxAccount === 'open',
       // mode:'deny' env vars are structurally absent (fresh
       // srt-sandbox profile env). mode:'mask' sentinels are
       // passed via the --env overlay so the sandboxed child sees
@@ -3579,6 +3619,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   const nextLoopback = newConfig.network?.allowLocalBinding === true
   if (
     getPlatform() === 'windows' &&
+    sessionSandboxAccount === 'filtered' &&
     config &&
     windowsWfpVerifiedLoopback !== undefined &&
     nextLoopback !== windowsWfpVerifiedLoopback
@@ -3753,6 +3794,7 @@ async function reset(): Promise<void> {
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  sessionSandboxAccount = 'filtered'
   srtWinSpawn = undefined
   windowsProfileRead = undefined
   windowsProfileReadWarnings = []

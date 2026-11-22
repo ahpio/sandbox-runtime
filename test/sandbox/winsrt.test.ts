@@ -4730,8 +4730,15 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.user.inSandboxGroup).toBe(true)
       expect(r.user.credPresent).toBe(true)
       // Keep in sync with SETUP_VERSION (vendor/srt-win-src/src/install.rs).
-      expect(r.user.markerVersion).toBe(3)
-      expect(r.user.setupVersion).toBe(3)
+      expect(r.user.markerVersion).toBe(4)
+      expect(r.user.setupVersion).toBe(4)
+      // The second account: what a session with the gate off runs as.
+      expect(r.user.openAccountSupported).toBe(true)
+      expect(r.user.openProvisioned).toBe(true)
+      expect(r.user.openSid).toMatch(/^S-1-5-21-/)
+      expect(r.user.openSid).not.toBe(r.user.sid)
+      expect(r.user.openCredPresent).toBe(true)
+      expect(r.user.openMarkerUserSid).toBe(r.user.openSid)
       expect(r.wfp.userSid).toBe(r.user.sid)
       // Combined `srt-win status` returns the same objects the two
       // per-noun calls do (one spawn instead of two).
@@ -4767,6 +4774,8 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     const u = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
     expect(u.provisioned).toBe(false)
     expect(u.credPresent).toBe(false)
+    expect(u.openProvisioned).toBe(false)
+    expect(u.openCredPresent).toBe(false)
     expect(u.markerVersion).toBeUndefined()
   })
 

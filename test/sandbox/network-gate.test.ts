@@ -1,6 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
 import { spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -17,6 +23,19 @@ import type {
   MxcRequest,
   MxcSdk,
 } from '../../src/sandbox/mxc-sandbox-utils.js'
+import {
+  DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  WINDOWS_LOOPBACK_NO_PROXY,
+  getSrtWinPath,
+  installWindowsSandboxAsync,
+  resolveSrtWin,
+  uninstallWindowsSandbox,
+  windowsOpenAccountMismatch,
+  windowsSandboxAccountRole,
+  wrapCommandWithSandboxWindows,
+  type SrtWinSpawn,
+  type WindowsSandboxUserStatus,
+} from '../../src/sandbox/windows-sandbox-utils.js'
 import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
 
 /**
@@ -308,4 +327,263 @@ describe.if(isWindows)('network gate on Windows (mxc)', () => {
     expect(request?.network.egress.default).toBe('deny')
     expect(request?.network.runtimeConfig?.networkProxy).toContain('127.0.0.1')
   })
+})
+
+const userStatus = (
+  open: Partial<WindowsSandboxUserStatus> = {},
+): WindowsSandboxUserStatus => ({
+  provisioned: true,
+  sid: 'S-1-5-21-11-22-33-1001',
+  groupExists: true,
+  groupSid: 'S-1-5-21-11-22-33-2001',
+  inBuiltinUsers: true,
+  inSandboxGroup: true,
+  hiddenFromLogon: true,
+  credPresent: true,
+  realUserSid: 'S-1-5-21-11-22-33-3001',
+  capabilities: [],
+  ...open,
+})
+
+const installedOpenAccount: Partial<WindowsSandboxUserStatus> = {
+  openAccountSupported: true,
+  openProvisioned: true,
+  openSid: 'S-1-5-21-11-22-33-1002',
+  openCredPresent: true,
+  openMarkerUserSid: 'S-1-5-21-11-22-33-1002',
+}
+
+/**
+ * The account a gate-off session runs as. Pure, and checked on every
+ * platform: the srt-win binaries themselves are only exercised on
+ * Windows.
+ */
+describe('the account choice', () => {
+  it('is the filtered account unless the gate says otherwise', () => {
+    expect(windowsSandboxAccountRole(undefined)).toBe('filtered')
+    expect(windowsSandboxAccountRole(true)).toBe('filtered')
+    expect(windowsSandboxAccountRole(false)).toBe('open')
+  })
+
+  it('refuses a gate-off session on an srt-win that predates the open account', () => {
+    const why = windowsOpenAccountMismatch(userStatus())
+    expect(why).toContain('predates the open sandbox account')
+    expect(why).toContain('Re-run the install')
+  })
+
+  it('refuses a gate-off session whose open account is not provisioned', () => {
+    const why = windowsOpenAccountMismatch(
+      userStatus({ openAccountSupported: true, openProvisioned: false }),
+    )
+    expect(why).toContain('is not provisioned')
+  })
+
+  it('refuses a gate-off session whose open credential is not readable', () => {
+    const why = windowsOpenAccountMismatch(
+      userStatus({ ...installedOpenAccount, openCredPresent: false }),
+    )
+    expect(why).toContain('credential is not readable')
+  })
+
+  it('accepts a gate-off session once the open account is installed', () => {
+    expect(
+      windowsOpenAccountMismatch(userStatus(installedOpenAccount)),
+    ).toBeUndefined()
+  })
+
+  it('launches a command under whichever account the session chose', () => {
+    const srtWin = { exe: 'C:\\srt-win.exe', prependArgs: [] } as const
+    const wrap = (openAccount: boolean | undefined): string[] =>
+      wrapCommandWithSandboxWindows({
+        command: 'exit 0',
+        srtWin,
+        httpProxyPort: 3128,
+        allowLoopback: true,
+        openAccount,
+      }).argv
+
+    const filtered = wrap(undefined)
+    expect(filtered).not.toContain('--open-account')
+    expect(filtered).toContain('--allow-loopback')
+    expect(filtered).toContain(`no_proxy=${WINDOWS_LOOPBACK_NO_PROXY}`)
+
+    // No filter is keyed on the open account, so there is no loopback
+    // mode to name and nothing for the loopback hosts to skip.
+    const open = wrap(true)
+    expect(open).toContain('--open-account')
+    expect(open).not.toContain('--allow-loopback')
+    expect(open).not.toContain(`no_proxy=${WINDOWS_LOOPBACK_NO_PROXY}`)
+  })
+})
+
+/**
+ * The same gate through `srt-win`, on the machine: a gate-off session
+ * runs as the open account, so an unlisted host is reachable while the
+ * install's WFP filters stay keyed on the filtered account, and the
+ * session's filesystem rules are stamped on whichever account runs.
+ *
+ * Its own sublayer (the other Windows suites keep theirs) and
+ * `--keep-user` at teardown, so it neither needs nor disturbs their
+ * installs.
+ */
+describe.if(isWindows)('network gate on Windows (srt-win)', () => {
+  const SUBLAYER = '4b7c2d10-6f3a-4e8b-9a1c-2d3e4f5a6b7c'
+  const PORT_RANGE: [number, number] = [
+    DEFAULT_WINDOWS_PROXY_PORT_RANGE[0],
+    DEFAULT_WINDOWS_PROXY_PORT_RANGE[1],
+  ]
+  const gateSrtWinPath = (): string =>
+    process.env.SRT_WIN_TEST_HOOKS_EXE ?? getSrtWinPath()
+  const gateSrtWin = (): SrtWinSpawn =>
+    resolveSrtWin({ path: gateSrtWinPath() })
+
+  let root: string
+  let workDir: string
+  let secretDir: string
+  let secretFile: string
+  let workFile: string
+  let server: Server
+  let port: number
+  let filteredSid: string | undefined
+  let openSid: string | undefined
+
+  beforeAll(async () => {
+    root = mkdtempSync(join(tmpdir(), 'srt-gate-srtwin-'))
+    workDir = join(root, 'work')
+    secretDir = join(root, 'secret')
+    secretFile = join(secretDir, 'gate-secret.txt')
+    workFile = join(workDir, 'made-by-sandbox.txt')
+    mkdirSync(workDir, { recursive: true })
+    mkdirSync(secretDir, { recursive: true })
+    writeFileSync(secretFile, 'gate-secret')
+    server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('gate-ok')
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    port = (server.address() as AddressInfo).port
+
+    const r = await installWindowsSandboxAsync({
+      sublayerGuid: SUBLAYER,
+      proxyPortRange: DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+      skipProfileGrant: true,
+      srtWin: gateSrtWin(),
+      timeoutMs: 120_000,
+    })
+    if (r.cancelled) throw new Error('install cancelled at the UAC prompt')
+    if (!r.user.provisioned || !r.user.openProvisioned || !r.user.openSid) {
+      throw new Error(
+        'install did not provision both sandbox accounts: ' +
+          JSON.stringify(r.user),
+      )
+    }
+    filteredSid = r.user.sid
+    openSid = r.user.openSid
+  }, 180_000)
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    uninstallWindowsSandbox({
+      sublayerGuid: SUBLAYER,
+      keepUser: true,
+      srtWin: gateSrtWin(),
+      timeoutMs: 55_000,
+    })
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    rmSync(root, { recursive: true, force: true })
+  }, 90_000)
+
+  const config = (enabled: boolean | undefined): SandboxRuntimeConfig => ({
+    network: {
+      ...(enabled === undefined ? {} : { enabled }),
+      allowedDomains: [],
+      deniedDomains: [],
+    },
+    filesystem: {
+      denyRead: [secretDir],
+      allowRead: [],
+      allowWrite: [workDir],
+      denyWrite: [],
+    },
+    windows: {
+      sublayerGuid: SUBLAYER,
+      proxyPortRange: PORT_RANGE,
+      srtWin: { path: gateSrtWinPath() },
+    },
+  })
+
+  // The server is in this process, so the run has to yield the event
+  // loop: spawnSync would block the very listener the command waits on.
+  const run = async (
+    command: string,
+  ): Promise<{ status: number | null; stdout: string; stderr: string }> => {
+    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(command)
+    return new Promise(resolve => {
+      const child = spawn(argv[0], argv.slice(1), {
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString()
+      })
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString()
+      })
+      const timer = setTimeout(() => child.kill('SIGKILL'), 90_000)
+      child.on('close', status => {
+        clearTimeout(timer)
+        resolve({ status, stdout, stderr })
+      })
+    })
+  }
+
+  const curl = (): string =>
+    `"${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\curl.exe" ` +
+    `-fsS --max-time 20 --resolve example.com:${port}:127.0.0.1 ` +
+    `http://example.com:${port}/`
+
+  it('runs as the open account and reaches an unlisted host with the gate off', async () => {
+    await SandboxManager.reset()
+    await SandboxManager.initialize(config(false))
+
+    expect(SandboxManager.getProxyPort()).toBeUndefined()
+    expect(SandboxManager.getSocksProxyPort()).toBeUndefined()
+    expect(SandboxManager.getNetworkRestrictionConfig()).toEqual({})
+
+    const who = await run('whoami /user /FO CSV /NH')
+    expect(who.status).toBe(0)
+    expect(who.stdout).toContain(openSid!)
+    expect(who.stdout).not.toContain(filteredSid!)
+
+    const result = await run(curl())
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('gate-ok')
+  }, 120_000)
+
+  it('keeps the filesystem grants and denies with the gate off', async () => {
+    const read = await run(`type "${secretFile}"`)
+    expect(read.status).not.toBe(0)
+    expect(read.stdout).not.toContain('gate-secret')
+
+    const write = await run(`echo granted>"${workFile}"`)
+    expect(write.status).toBe(0)
+    expect(readFileSync(workFile, 'utf8')).toContain('granted')
+  }, 120_000)
+
+  it('runs as the filtered account and blocks the same host with the gate on', async () => {
+    await SandboxManager.reset()
+    await SandboxManager.initialize(config(undefined))
+
+    expect(SandboxManager.getProxyPort()).toBeDefined()
+
+    const who = await run('whoami /user /FO CSV /NH')
+    expect(who.status).toBe(0)
+    expect(who.stdout).toContain(filteredSid!)
+
+    const result = await run(curl())
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).not.toContain('gate-ok')
+  }, 120_000)
 })

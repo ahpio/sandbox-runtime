@@ -1574,11 +1574,12 @@ impl Report {
     }
 }
 
-/// The SIDs of the sandbox account's token: those it always carries.
+/// The SIDs of either sandbox account's token: those it always carries.
 fn sandbox_sids(ids: &Ids) -> Vec<&str> {
     ids.sandbox_user_sid
         .as_deref()
         .into_iter()
+        .chain(ids.sandbox_open_user_sid.as_deref())
         .chain(ids.group_sid.as_deref())
         .chain(plan::SANDBOX_ALWAYS)
         .collect()
@@ -3804,6 +3805,7 @@ mod tests {
         Ids {
             group_sid: Some(GROUP.to_owned()),
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             real_user_sid: crate::sid::current_user_sid().unwrap(),
             previous_group_sids: Vec::new(),
         }

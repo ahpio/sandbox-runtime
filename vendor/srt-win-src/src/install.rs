@@ -21,9 +21,11 @@ use crate::state_db;
 use crate::{dpapi, logon, runner, user};
 
 /// Bumped when the `sandbox_user` row changes, when `install` gains a
-/// step (v2: ambient stamps), or when an older broker must stop
-/// launching here (v3: kept write grants). See [`check_marker`].
-pub const SETUP_VERSION: u32 = 3;
+/// step (v2: ambient stamps), when an older broker must stop launching
+/// here (v3: kept write grants), or when a gate-off session needs an
+/// account an older install does not have (v4: the open account). See
+/// [`check_marker`].
+pub const SETUP_VERSION: u32 = 4;
 
 /// `Err` unless `marker_version` is the one this build was made with.
 /// The message is what `read_cred` callers print; it names the repair.
@@ -66,6 +68,11 @@ pub fn require_current_setup() -> Result<SetupInfo> {
 pub struct SetupInfo {
     pub sandbox_user: String,
     pub sandbox_user_sid: String,
+    /// The account gate-off sessions run as, and its SID. `None` on an
+    /// install from before the open account (marker 3): `check_marker`
+    /// refuses it before anything looks here.
+    pub sandbox_open_user: Option<String>,
+    pub sandbox_open_user_sid: Option<String>,
     pub sandbox_group_sid: String,
     pub marker_version: u32,
     pub created_at_unix: u64,
@@ -144,31 +151,42 @@ pub fn provision_machine_store(sandbox_group_sid: &str) -> Result<std::path::Pat
 }
 
 /// Record the install: identity + marker into
-/// `HKLM\SOFTWARE\sandbox-runtime` and the DPAPI credential blob
-/// into its `Cred` subkey (created with an explicit
+/// `HKLM\SOFTWARE\sandbox-runtime` and the DPAPI credential blobs into
+/// its `Cred` subkey (created with an explicit
 /// SYSTEM/Admins-full, Users-read, sandbox-DENY DACL — atomic with
 /// creation, and nothing unprivileged can pre-create a key under
-/// HKLM\SOFTWARE). `MarkerVersion` is written LAST: registry writes
-/// are not transactional across values, so the marker is the commit
-/// point a crashed install never reaches.
-pub fn write_setup(u: &user::ProvisionedUser) -> Result<()> {
+/// HKLM\SOFTWARE). Both accounts are recorded; each has its own blob,
+/// since each has its own rotated password. `MarkerVersion` is written
+/// LAST: registry writes are not transactional across values, so the
+/// marker is the commit point a crashed install never reaches.
+pub fn write_setup(u: &user::ProvisionedUser, open: &user::ProvisionedUser) -> Result<()> {
     let blob = dpapi::protect_machine(u.password.as_bytes())?;
+    let open_blob = dpapi::protect_machine(open.password.as_bytes())?;
     let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
     // A --force re-install under a DIFFERENT sandbox-user name must
     // drop the recorded CA: the cert was written into the OLD
-    // account's CurrentUser\Root hive, so keeping the record for
-    // the new account would make the trust reconcile skip a re-trust
+    // accounts' CurrentUser\Root hives, so keeping the record for
+    // the new pair would make the trust reconcile skip a re-trust
     // that has never happened (schannel then fails at runtime
-    // instead of being healed at setup).
-    let name_changed = base
-        .get_sz("SandboxUser")?
-        .is_some_and(|old| old != u.username);
+    // instead of being healed at setup). A changed open-account name
+    // is the same story, and so is an install that had no open
+    // account at all: the CA was trusted in the filtered account
+    // only, and the new account's hive has never seen it.
+    let no_open_yet = base.get_sz("SandboxOpenUserSid")?.is_none();
+    let name_changed = no_open_yet
+        || base
+            .get_sz("SandboxUser")?
+            .is_some_and(|old| old != u.username)
+        || base
+            .get_sz("SandboxOpenUser")?
+            .is_some_and(|old| old != open.username);
     let cred_sddl = format!(
         "O:BAD:P(D;;KA;;;{})(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;BU)",
         u.group_sid
     );
     let cred = crate::reg::ensure_key_with_dacl(crate::reg::CRED_SUBKEY, &cred_sddl)?;
     cred.set_binary("Blob", &blob)?;
+    cred.set_binary(OPEN_CRED_BLOB, &open_blob)?;
     // Ca subkey: Users KEY_READ|KEY_SET_VALUE (0x2001b) so the
     // unelevated trust-ca can record the DER; sandbox group DENY so
     // the CHILD cannot touch the record.
@@ -182,6 +200,8 @@ pub fn write_setup(u: &user::ProvisionedUser) -> Result<()> {
     }
     base.set_sz("SandboxUser", &u.username)?;
     base.set_sz("SandboxUserSid", &u.sid)?;
+    base.set_sz("SandboxOpenUser", &open.username)?;
+    base.set_sz("SandboxOpenUserSid", &open.sid)?;
     base.set_sz("SandboxGroupSid", &u.group_sid)?;
     base.set_qword(
         "CreatedAt",
@@ -228,12 +248,12 @@ pub fn ambient_deny_recorded(canon: &str) -> bool {
 
 /// Whether the install-time ambient write-deny step is complete:
 /// every CURRENT target is both recorded and carrying its on-disk
-/// deny ACE. An install that died mid-list falls through the
-/// install early-out and finishes the remainder; "re-run `srt-win
-/// install`" is the repair for on-disk drift. Targets that no
-/// longer canonicalize are ignored; any error reads as incomplete
-/// (the idempotent install steps just run).
-pub fn ambient_complete(sandbox_sid: &str, raw_targets: &[String]) -> bool {
+/// deny ACE for every sandbox account. An install that died mid-list
+/// falls through the install early-out and finishes the remainder;
+/// "re-run `srt-win install`" is the repair for on-disk drift.
+/// Targets that no longer canonicalize are ignored; any error reads as
+/// incomplete (the idempotent install steps just run).
+pub fn ambient_complete(sandbox_sids: &[&str], raw_targets: &[String]) -> bool {
     let recorded = match ambient_recorded_paths() {
         Ok(v) => v,
         Err(_) => return false,
@@ -243,18 +263,25 @@ pub fn ambient_complete(sandbox_sid: &str, raw_targets: &[String]) -> bool {
             return true;
         };
         recorded.contains(&canon)
-            && crate::acl::sandbox_deny_present(&canon, sandbox_sid).unwrap_or(false)
+            && sandbox_sids
+                .iter()
+                .all(|sid| crate::acl::sandbox_deny_present(&canon, sid).unwrap_or(false))
     })
 }
 
 /// Stamp the ambient write-denies: apply `(D;OICI;WriteDeny)` for
-/// the sandbox SID DIRECTLY on each static env-derived target (per
-/// path best-effort), then record the applied set in the registry.
+/// every sandbox account SID DIRECTLY on each static env-derived
+/// target (per account and path best-effort), then record the applied
+/// set in the registry. A target is recorded once any account's ACE
+/// landed, so a partially stamped path is retried and never lost.
 /// Under the session init lock so a live broker's recompose in this
 /// TS session cannot interleave a converge that misses the fresh
 /// deny; SeRestorePrivilege enabled for TrustedInstaller-owned
 /// targets.
-pub fn set_ambient_denies(sandbox_sid: &str, raw_paths: &[String]) -> Result<AmbientReport> {
+pub fn set_ambient_denies(
+    sandbox_sids: &[&str],
+    raw_paths: &[String],
+) -> Result<AmbientReport> {
     let _lock = state_db::acquire_session_lock()?;
     if let Err(e) = crate::util::enable_privilege("SeRestorePrivilege") {
         eprintln!("srt-win: ambient deny: enable SeRestorePrivilege: {e:#}");
@@ -274,17 +301,27 @@ pub fn set_ambient_denies(sandbox_sid: &str, raw_paths: &[String]) -> Result<Amb
                 continue;
             }
         };
-        match crate::acl::apply_sandbox_aces(&canon, sandbox_sid, deny_only) {
-            Ok(()) => {
-                if !recorded.contains(&canon) {
-                    recorded.push(canon.clone());
+        let mut any_ok = false;
+        let mut all_ok = true;
+        for sid in sandbox_sids {
+            match crate::acl::apply_sandbox_aces(&canon, sid, deny_only) {
+                Ok(()) => any_ok = true,
+                Err(e) => {
+                    all_ok = false;
+                    eprintln!(
+                        "srt-win: warning: ambient deny stamp '{canon}' \
+                         for {sid}: {e:#}"
+                    );
                 }
-                report.applied.push(canon);
             }
-            Err(e) => {
-                eprintln!("srt-win: warning: ambient deny stamp '{canon}': {e:#}");
-                report.failed.push(canon);
-            }
+        }
+        if any_ok && !recorded.contains(&canon) {
+            recorded.push(canon.clone());
+        }
+        if all_ok {
+            report.applied.push(canon);
+        } else {
+            report.failed.push(canon);
         }
     }
     let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
@@ -293,12 +330,12 @@ pub fn set_ambient_denies(sandbox_sid: &str, raw_paths: &[String]) -> Result<Amb
 }
 
 /// Remove the ambient write-denies (uninstall): per RECORDED path
-/// (admin-written list — trustworthy), strip the sandbox SID's ACEs
-/// directly; a failed removal keeps its entry so `status` surfaces
-/// it and a later uninstall/install retries. Returns how many paths
-/// actually carried a deny that was removed. Same lock + privilege
-/// preamble as [`set_ambient_denies`].
-pub fn clear_ambient_denies(sandbox_sid: &str) -> Result<usize> {
+/// (admin-written list — trustworthy), strip every sandbox account
+/// SID's ACEs directly; a failed removal keeps its entry so `status`
+/// surfaces it and a later uninstall/install retries. Returns how many
+/// paths actually carried a deny that was removed. Same lock +
+/// privilege preamble as [`set_ambient_denies`].
+pub fn clear_ambient_denies(sandbox_sids: &[&str]) -> Result<usize> {
     let _lock = state_db::acquire_session_lock()?;
     if let Err(e) = crate::util::enable_privilege("SeRestorePrivilege") {
         eprintln!("srt-win: ambient deny: enable SeRestorePrivilege: {e:#}");
@@ -307,17 +344,29 @@ pub fn clear_ambient_denies(sandbox_sid: &str) -> Result<usize> {
     let mut removed = 0usize;
     let mut kept: Vec<String> = Vec::new();
     for canon in recorded {
-        let had = crate::acl::sandbox_deny_present(&canon, sandbox_sid).unwrap_or(false);
-        match crate::acl::apply_sandbox_aces(&canon, sandbox_sid, crate::acl::SbAceSet::default()) {
-            Ok(()) => {
-                if had {
-                    removed += 1;
+        let mut had = false;
+        let mut failed = false;
+        for sid in sandbox_sids {
+            had |= crate::acl::sandbox_deny_present(&canon, sid).unwrap_or(false);
+            match crate::acl::apply_sandbox_aces(
+                &canon,
+                sid,
+                crate::acl::SbAceSet::default(),
+            ) {
+                Ok(()) => {}
+                Err(e) => {
+                    failed = true;
+                    eprintln!(
+                        "srt-win: warning: ambient deny removal '{canon}' \
+                         for {sid}: {e:#}"
+                    );
                 }
             }
-            Err(e) => {
-                eprintln!("srt-win: warning: ambient deny removal '{canon}': {e:#}");
-                kept.push(canon);
-            }
+        }
+        if failed {
+            kept.push(canon);
+        } else if had {
+            removed += 1;
         }
     }
     if let Some(base) = crate::reg::Key::open(crate::reg::BASE, true)? {
@@ -356,6 +405,8 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
     Ok(Some(SetupInfo {
         sandbox_user,
         sandbox_user_sid,
+        sandbox_open_user: base.get_sz("SandboxOpenUser")?,
+        sandbox_open_user_sid: base.get_sz("SandboxOpenUserSid")?,
         sandbox_group_sid,
         marker_version,
         created_at_unix: base.get_qword("CreatedAt")?.unwrap_or(0),
@@ -544,6 +595,26 @@ pub fn read_cred() -> Result<SandboxCred> {
     })
 }
 
+/// Decrypt and return the open account's credential — what a session
+/// with `network.enabled: false` launches as.
+pub fn read_open_cred() -> Result<SandboxCred> {
+    let info = require_current_setup()?;
+    let user = info.sandbox_open_user.clone().ok_or_else(|| {
+        anyhow!(
+            "the install record has no open account — re-run \
+             `srt-win install` (elevated) to add it"
+        )
+    })?;
+    let blob = read_open_cred_blob()?;
+    let pw = String::from_utf8(dpapi::unprotect(&blob)?).context("password is not UTF-8")?;
+    Ok(SandboxCred { user, pw })
+}
+
+/// The value holding the filtered account's DPAPI blob; the open
+/// account's sits beside it under [`OPEN_CRED_BLOB`].
+const CRED_BLOB: &str = "Blob";
+const OPEN_CRED_BLOB: &str = "BlobOpen";
+
 /// The DPAPI blob from `HKLM\...\Cred\Blob`. A missing key/value
 /// means the install is incomplete; the repair is the elevated
 /// re-run either way.
@@ -555,10 +626,27 @@ pub(crate) fn read_cred_blob() -> Result<Vec<u8>> {
             crate::reg::CRED_SUBKEY,
         )
     })?;
-    key.get_binary("Blob")?.ok_or_else(|| {
+    key.get_binary(CRED_BLOB)?.ok_or_else(|| {
         anyhow!(
             "credential key present but Blob value missing — re-run \
              `srt-win install` (elevated)"
+        )
+    })
+}
+
+/// The open account's DPAPI blob from `HKLM\...\Cred\BlobOpen`.
+fn read_open_cred_blob() -> Result<Vec<u8>> {
+    let key = crate::reg::Key::open(crate::reg::CRED_SUBKEY, false)?.ok_or_else(|| {
+        anyhow!(
+            "no credential key (HKLM\\{}) — run `srt-win install` \
+             (elevated) to (re)provision it",
+            crate::reg::CRED_SUBKEY,
+        )
+    })?;
+    key.get_binary(OPEN_CRED_BLOB)?.ok_or_else(|| {
+        anyhow!(
+            "credential key present but {OPEN_CRED_BLOB} value missing — \
+             re-run `srt-win install` (elevated) to add the open account"
         )
     })
 }
@@ -578,31 +666,54 @@ pub fn cred_present() -> bool {
         .unwrap_or(false)
 }
 
-/// Write `der` into the **sandbox user's** `CurrentUser\Root` via a
-/// one-shot `CreateProcessWithLogonW(srt-sandbox, "srt-win runner")`
-/// carrying [`runner::RunnerCmd::InstallCa`], and — only on success
-/// — record it in the `sandbox_user.ca_cert` column. The state-DB
-/// record is what the host's `tlsTerminate` gate keys on, so it must
-/// only exist when the registry write actually landed. Called only
-/// from `srt-win user trust-ca` (with [`read_cred`]); `srt-win
-/// install` never touches the CA. Persistent until `srt-win
-/// uninstall` deletes the profile.
-pub fn trust_ca(der: &crate::cert_store::CertDer, cred: &SandboxCred, sb_sid: &str) -> Result<()> {
-    let code = logon::spawn_runner(
-        &cred.user,
-        &cred.pw,
-        sb_sid,
-        None,
-        &runner::RunnerCmd::InstallCa { der: der.clone() },
-        false,
-        None,
-    )
-    .context("spawn runner for CA install")?;
-    if code != 0 {
-        return Err(anyhow!(
-            "CA install runner exited {code} — the registry write \
-             into the sandbox user's hive failed; CA NOT recorded"
-        ));
+/// [`cred_present`] for the open account.
+pub fn open_cred_present() -> bool {
+    read_open_cred_blob()
+        .and_then(|b| dpapi::unprotect(&b))
+        .map(|pw| !pw.is_empty())
+        .unwrap_or(false)
+}
+
+/// One account a CA record must land in: the credential to launch its
+/// runner with, and its SID.
+pub struct CaAccount<'a> {
+    pub cred: &'a SandboxCred,
+    pub sid: &'a str,
+}
+
+/// Write `der` into every account's `CurrentUser\Root` via a
+/// one-shot `CreateProcessWithLogonW(<account>, "srt-win runner")`
+/// carrying [`runner::RunnerCmd::InstallCa`], and — only when every
+/// account succeeded — record it once under `Ca\Der`. A gate-off
+/// session runs as the open account, so a CA trusted only by the
+/// filtered one would fail there at runtime. The record is what the
+/// host's `tlsTerminate` gate keys on, so it must only exist when
+/// every registry write actually landed. Called only from `srt-win
+/// user trust-ca` (with [`read_cred`] and [`read_open_cred`]);
+/// `srt-win install` never touches the CA. Persistent until
+/// `srt-win uninstall` deletes the profiles.
+pub fn trust_ca(der: &crate::cert_store::CertDer, accounts: &[CaAccount<'_>]) -> Result<()> {
+    if accounts.is_empty() {
+        return Err(anyhow!("no sandbox accounts to trust the CA in"));
+    }
+    for a in accounts {
+        let code = logon::spawn_runner(
+            &a.cred.user,
+            &a.cred.pw,
+            a.sid,
+            None,
+            &runner::RunnerCmd::InstallCa { der: der.clone() },
+            false,
+            None,
+        )
+        .with_context(|| format!("spawn runner for CA install as '{}'", a.cred.user))?;
+        if code != 0 {
+            return Err(anyhow!(
+                "CA install runner as '{}' exited {code} — the registry \
+                 write into that account's hive failed; CA NOT recorded",
+                a.cred.user,
+            ));
+        }
     }
     // Set-value open, not KEY_WRITE: trust-ca runs UNELEVATED, and
     // the Ca DACL grants Users exactly KEY_READ|KEY_SET_VALUE.
@@ -628,6 +739,8 @@ pub fn clear_setup() -> Result<()> {
         for v in [
             "SandboxUser",
             "SandboxUserSid",
+            "SandboxOpenUser",
+            "SandboxOpenUserSid",
             "SandboxGroupSid",
             "MarkerVersion",
             "CreatedAt",

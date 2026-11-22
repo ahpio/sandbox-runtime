@@ -392,6 +392,9 @@ pub struct Ids {
     /// no longer tell the group's ACEs apart.
     pub group_sid: Option<String>,
     pub sandbox_user_sid: Option<String>,
+    /// The open account a gate-off session runs as; both accounts
+    /// belong to the group and carry the same kept grants.
+    pub sandbox_open_user_sid: Option<String>,
     pub real_user_sid: String,
     /// Sandbox groups other than `group_sid` that grants recorded for
     /// this user were made for: the marker's, when the install record
@@ -419,7 +422,10 @@ impl Ids {
         previous_group_sids.dedup();
         Ok(Self {
             group_sid,
-            sandbox_user_sid: setup.map(|s| s.sandbox_user_sid),
+            sandbox_user_sid: setup.as_ref().map(|s| s.sandbox_user_sid.clone()),
+            sandbox_open_user_sid: setup
+                .as_ref()
+                .and_then(|s| s.sandbox_open_user_sid.clone()),
             real_user_sid: crate::sid::current_user_sid()?,
             previous_group_sids,
         })
@@ -431,6 +437,7 @@ impl Ids {
             real_user_sid: &self.real_user_sid,
             previous_group_sids: &self.previous_group_sids,
             sandbox_user_sid: self.sandbox_user_sid.as_deref(),
+            sandbox_open_user_sid: self.sandbox_open_user_sid.as_deref(),
             recorded_denies: None,
         }
     }
@@ -625,16 +632,22 @@ pub(crate) fn converge_on(
     let aces = acl::read_aces_at(target).with_context(|| format!("read the DACL of '{canon}'"))?;
     let is_root = want.iter().any(|a| is_capability_sid(&a.sid));
     if is_root {
-        // An ALLOW for the sandbox user SID would pass both access
-        // checks of every session's token.
-        if let Some(sb) = &ids.sandbox_user_sid
-            && acl::allows_more_than_read(&aces, sb)
+        // An ALLOW for either sandbox account SID would pass both
+        // access checks of every session's token.
+        for sb in [
+            ids.sandbox_user_sid.as_ref(),
+            ids.sandbox_open_user_sid.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            bail!(
-                "'{canon}' grants write access to the sandbox user SID (a session without \
-                 the write-restricted token holds it); refusing to keep a persistent grant \
-                 beside it"
-            );
+            if acl::allows_more_than_read(&aces, sb) {
+                bail!(
+                    "'{canon}' grants write access to a sandbox account SID (a \
+                     session without the write-restricted token holds it); \
+                     refusing to keep a persistent grant beside it"
+                );
+            }
         }
         for ace in acl::owner_write_paths(&aces) {
             eprintln!(
@@ -1686,6 +1699,7 @@ mod tests {
             real_user_sid: "S-1-5-21-1-2-3-1000",
             previous_group_sids: &[],
             sandbox_user_sid: None,
+            sandbox_open_user_sid: None,
             recorded_denies: Some(&listed),
         };
         for d in &wanted_denies {
