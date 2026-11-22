@@ -29,4 +29,5 @@ A pass merges one upstream release into the `ahpio` branch and releases it. Pass
 
 - Upstream `v0.0.83` at `0bbebed0aa9a`, which is also upstream `main` on 2026-11-22.
 - The fork's changes merged in PR #1 as `5ec7d8a`.
-- `0.0.83-rc.0` is built and verified by CI run 44989520168. Its first npm publish waits for Softov, since npm asks for his one-time password.
+- `0.0.83-rc.0` is on npm under `next`, published with provenance by `release.yml` run 45039413969 from the prerelease `v0.0.83-rc.0` on `2a71a1f`.
+- `latest` is `0.0.0`, a placeholder Softov published by hand so the trusted publisher could be set.
