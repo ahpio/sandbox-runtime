@@ -916,7 +916,7 @@ describe('WINDOWS_INSTALL_COMMAND (pure, all platforms)', () => {
 
   it('is the only spelling in src/ and the README', () => {
     const otherSpelling =
-      /npx\s+(-\S+\s+)*sandbox-runtime|(?<!@anthropic-ai\/)sandbox-runtime\s+windows-/
+      /npx\s+(-\S+\s+)*sandbox-runtime|(?<!@ahpio\/)sandbox-runtime\s+windows-/
     const sources = fs
       .readdirSync(join(repoRoot, 'src'), { recursive: true, encoding: 'utf8' })
       .filter(file => file.endsWith('.ts'))

@@ -1438,6 +1438,9 @@ async function initializeSteps(
       try {
         probeRequest = buildMxcRequest({
           command: 'exit 0',
+          // The gate: with network disabled the probe carries open
+          // egress and no proxy, the same policy every spawn gets.
+          networkEnabled: runtimeConfig.network.enabled !== false,
           // Representative proxy port: the real mux port is bound
           // later in initialize (inside this same range on Windows),
           // and the probe only needs the policy shape, not a live
@@ -3508,6 +3511,7 @@ async function spawnSandboxed(
   const request = buildMxcRequest({
     command,
     commandId: options.commandId,
+    networkEnabled: !isNetworkDisabled(customConfig),
     httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
     socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
     proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,

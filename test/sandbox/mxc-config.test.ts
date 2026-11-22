@@ -142,6 +142,20 @@ describe('MXC SDK request', () => {
     })
   })
 
+  it('opens egress and passes no proxy when network is disabled', () => {
+    const req = buildMxcRequest({
+      command: 'exit 0',
+      httpProxyPort: 48123,
+      proxyAuthToken: 'tok',
+      networkEnabled: false,
+    })
+    expect(req.network).toEqual({
+      egress: { default: 'allow' },
+      ingress: { default: 'deny', hostLoopback: 'deny' },
+    })
+    expect(req.environment).not.toHaveProperty('https_proxy')
+  })
+
   it('routes egress through the host proxy when there is one', () => {
     const req = buildMxcRequest({
       command: 'exit 0',

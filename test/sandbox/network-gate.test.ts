@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -125,12 +125,39 @@ describe.if(POSIX)('network gate on Linux and macOS', () => {
     return next
   }
 
-  const run = (command: string) =>
-    spawnSync(command, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 20_000,
-      env: env(),
+  /**
+   * The target server and the proxy both live in this process, so the
+   * run has to yield the event loop: spawnSync would block the very
+   * server the command waits on. The timeout is a guard, not the
+   * assertion - every command here finishes well inside it.
+   */
+  const run = (
+    command: string,
+  ): Promise<{
+    status: number | null
+    signal: NodeJS.Signals | null
+    stdout: string
+    stderr: string
+  }> =>
+    new Promise(resolve => {
+      const child = spawn(command, {
+        shell: true,
+        env: env(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString()
+      })
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString()
+      })
+      const timer = setTimeout(() => child.kill('SIGKILL'), 20_000)
+      child.on('close', (status, signal) => {
+        clearTimeout(timer)
+        resolve({ status, signal, stdout, stderr })
+      })
     })
 
   it('starts no proxy and lets an unlisted host through when disabled', async () => {
@@ -142,7 +169,7 @@ describe.if(POSIX)('network gate on Linux and macOS', () => {
     expect(SandboxManager.getNetworkRestrictionConfig()).toEqual({})
 
     const wrapped = await SandboxManager.wrapWithSandbox(probeCommand())
-    const result = run(wrapped)
+    const result = await run(wrapped)
     expect(result.status).toBe(0)
     expect(result.stdout).toContain('gate-ok')
   })
@@ -157,7 +184,7 @@ describe.if(POSIX)('network gate on Linux and macOS', () => {
     )
 
     const wrapped = await SandboxManager.wrapWithSandbox(probeCommand())
-    expect(run(wrapped).status).not.toBe(0)
+    expect((await run(wrapped)).status).not.toBe(0)
   })
 
   it('keeps the filesystem rules with the gate off', async () => {
@@ -165,7 +192,7 @@ describe.if(POSIX)('network gate on Linux and macOS', () => {
     await SandboxManager.initialize(config(false))
 
     const wrapped = await SandboxManager.wrapWithSandbox(`cat ${secretFile}`)
-    const result = run(wrapped)
+    const result = await run(wrapped)
     expect(result.status).not.toBe(0)
     expect(result.stdout).not.toContain(secret)
   })
@@ -258,6 +285,7 @@ describe.if(isWindows)('network gate on Windows (mxc)', () => {
     await process.wait()
 
     const request = requests.at(-1)
+    expect(request?.network.egress.default).toBe('allow')
     expect(request?.network.runtimeConfig).toBeUndefined()
     expect(
       request?.filesystem.deniedPaths.some(p =>
@@ -277,6 +305,7 @@ describe.if(isWindows)('network gate on Windows (mxc)', () => {
     await process.wait()
 
     const request = requests.at(-1)
+    expect(request?.network.egress.default).toBe('deny')
     expect(request?.network.runtimeConfig?.networkProxy).toContain('127.0.0.1')
   })
 })

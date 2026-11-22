@@ -57,7 +57,9 @@
  *     `ingress.default: 'allow'` + `ingress.hostLoopback: 'allow'` and
  *     `runtimeConfig.networkProxy` naming the proxy port as the only
  *     way out (MXC 1.0's host proxy without a peer identity). srt's
- *     proxy does the domain filtering exactly as on macOS/Linux.
+ *     proxy does the domain filtering exactly as on macOS/Linux. With
+ *     `network.enabled: false`, `egress.default: 'allow'` and no proxy
+ *     or ingress allowance.
  *   - UI: on for every command (see {@link buildMxcRequest}), with
  *     clipboard and input injection blocked.
  */
@@ -103,7 +105,7 @@ export interface MxcRequest {
     deniedPaths: string[]
   }
   network: {
-    egress: { default: 'deny' }
+    egress: { default: 'allow' | 'deny' }
     ingress: { default: 'allow' | 'deny'; hostLoopback: 'allow' | 'deny' }
     runtimeConfig?: { networkProxy: string }
   }
@@ -413,6 +415,11 @@ export interface MxcSandboxParams {
   httpProxyPort?: number
   socksProxyPort?: number
   proxyAuthToken?: string
+  /**
+   * `network.enabled`. When false the container gets direct egress and
+   * no proxy is passed; the filesystem policy is unchanged.
+   */
+  networkEnabled?: boolean
   /** `mode:'mask'` sentinels; the child inherits no other env. */
   setEnvVars?: Readonly<Record<string, string>>
   /** srt read deny-list (expanded, concrete paths). */
@@ -439,7 +446,13 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
   // the child's %TEMP%: see CHILD_BASE_ENV_VARS.
   const temp = process.env.TEMP ?? process.env.TMP
   const sh = p.binShell ?? parseWindowsBinShell(undefined)
-  const hasProxy = p.httpProxyPort !== undefined
+  // The gate: with network disabled no proxy is passed, even if one is
+  // named, and egress is open.
+  const networkEnabled = p.networkEnabled !== false
+  const httpProxyPort = networkEnabled ? p.httpProxyPort : undefined
+  const socksProxyPort = networkEnabled ? p.socksProxyPort : undefined
+  const proxyAuthToken = networkEnabled ? p.proxyAuthToken : undefined
+  const hasProxy = httpProxyPort !== undefined
   // The proxy username carries the command's attribution key, as on
   // srt-win, so per-command network lists and violations reach it.
   const encodedCommand = encodeSandboxedCommand(
@@ -447,10 +460,10 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
   )
   const proxyUser = proxyUsernameFor(encodedCommand)
   const proxyEnv = generateProxyEnvVars(
-    p.httpProxyPort,
-    p.socksProxyPort,
+    httpProxyPort,
+    socksProxyPort,
     undefined,
-    p.proxyAuthToken,
+    proxyAuthToken,
     undefined,
     encodedCommand,
   )
@@ -486,7 +499,7 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
     command: buildShellCommandLine(sh, p.command),
     filesystem: { readonlyPaths, readwritePaths, deniedPaths },
     network: {
-      egress: { default: 'deny' },
+      egress: { default: networkEnabled ? 'deny' : 'allow' },
       // MXC 1.0 refuses a host proxy unless ingress.default is 'allow',
       // and one without a peer identity also needs hostLoopback 'allow'
       // (resolved on its own, not inherited). On Windows 11 25H2 (build
@@ -498,10 +511,10 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
             ingress: { default: 'allow', hostLoopback: 'allow' },
             runtimeConfig: {
               networkProxy: `http://${
-                p.proxyAuthToken
-                  ? `${encodeURIComponent(proxyUser)}:${p.proxyAuthToken}@`
+                proxyAuthToken
+                  ? `${encodeURIComponent(proxyUser)}:${proxyAuthToken}@`
                   : ''
-              }127.0.0.1:${p.httpProxyPort}`,
+              }127.0.0.1:${httpProxyPort}`,
             },
           }
         : { ingress: { default: 'deny', hostLoopback: 'deny' } }),
@@ -517,7 +530,7 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
       ? { timeoutMs: p.timeoutMs }
       : {}),
     workingDirectory,
-    environment: buildChildEnv(p, proxyEnv),
+    environment: buildChildEnv(p, proxyEnv, hasProxy),
     inheritDefaultEnvironment: false,
   }
 }
@@ -581,6 +594,7 @@ const CHILD_BASE_ENV_VARS = [
 function buildChildEnv(
   p: MxcSandboxParams,
   proxyEnv: readonly string[],
+  hasProxy: boolean,
 ): Record<string, string> {
   // Same two deletions as srt-win, same reasons: TMPDIR is POSIX-only
   // and breaks msys2 tools; NO_PROXY would send localhost DIRECT into
@@ -610,7 +624,7 @@ function buildChildEnv(
   // value wins.
   return mergeWindowsEnv(
     base,
-    p.httpProxyPort ? { NODE_USE_ENV_PROXY: '1' } : {},
+    hasProxy ? { NODE_USE_ENV_PROXY: '1' } : {},
     p.setEnvVars ?? {},
     envListToObject(envList),
     gitCfg,
