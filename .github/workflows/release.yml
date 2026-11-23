@@ -1143,6 +1143,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The fork holds upstream's tags, and upstream's `v0.0.83` is a commit of
+      # upstream's own. A fork release is tagged `ahpio-v<version>`, so its tag
+      # never lands on an upstream tag of the same number.
+      - name: Verify release tag is a fork tag
+        if: github.event_name == 'release'
+        run: |
+          case "$GITHUB_REF_NAME" in
+            ahpio-v*) ;;
+            *) echo "::error::Release tag $GITHUB_REF_NAME is not ahpio-v<version>. A v* tag is upstream's."; exit 1 ;;
+          esac
+
+      - name: Verify the package is the fork's
+        if: github.event_name == 'release'
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          if [ "$NAME" != "@ahpio/sandbox-runtime" ]; then
+            echo "::error::package.json names $NAME, not @ahpio/sandbox-runtime. The tag points at upstream's tree."
+            exit 1
+          fi
+
       - name: Verify release tag is on ahpio
         if: github.event_name == 'release'
         run: |
@@ -1155,7 +1175,7 @@ jobs:
       - name: Verify tag matches package.json version
         if: github.event_name == 'release'
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TAG_VERSION="${GITHUB_REF_NAME#ahpio-v}"
           PKG_VERSION=$(node -p "require('./package.json').version")
           if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
             echo "::error::Tag version ($TAG_VERSION) doesn't match package.json ($PKG_VERSION)"
@@ -1837,10 +1857,10 @@ jobs:
         with:
           name: package
       # Trusted publishing attaches provenance without --provenance.
-      # A prerelease (a tag with a hyphen, e.g. v0.0.83-rc.0) publishes
-      # under npm's next tag, so latest stays on a stable release.
+      # A prerelease (a version with a hyphen, e.g. ahpio-v0.0.84-rc.0)
+      # publishes under npm's next tag, so latest stays on a stable release.
       - run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${GITHUB_REF_NAME#ahpio-v}"
           if [[ "$version" == *-* ]]; then
             npm publish ./*.tgz --access public --tag next
           else
