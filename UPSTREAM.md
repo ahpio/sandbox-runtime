@@ -16,14 +16,15 @@ A pass merges one upstream release into the `ahpio` branch and releases it. Pass
 8. Run `bun test`, with `test/sandbox/network-gate.test.ts` and `test/sandbox/mxc-config.test.ts`.
 9. Open a pull request into `ahpio`. CI runs the integration tests and `release.yml` without the publish, on Linux, macOS and Windows.
 10. Merge on Softov's word, and log the pass here.
-11. Publish a GitHub release `v<version>-rc.0`, marked as a prerelease. `release.yml` publishes it to npm under `next`.
-12. Run ahpd's computer suite against the release candidate. Then release `v<version>` the same way, under `latest`.
+11. Publish a GitHub release on the tag `ahpio-v<version>-rc.0`, marked as a prerelease, with `--target ahpio`. `release.yml` publishes it to npm under `next`.
+12. Run ahpd's computer suite against the release candidate. Then set the version to `<version>`, and release the tag `ahpio-v<version>` the same way, under `latest`.
 
 ## Versions
 
 - A release carries upstream's number: upstream `0.0.84` ships as `0.0.84-rc.0`, then `0.0.84`.
 - A fork-only fix between two upstream releases ships as `<version>-ahpio.<n>`, such as `0.0.84-ahpio.1`. Its hyphen puts it under npm's `next`, and ahpd pins the exact version.
 - A version with a hyphen goes to `next` and one without goes to `latest`, as `release.yml` decides from the tag.
+- A fork release is tagged `ahpio-v<version>`. The fork holds upstream's tags, and a `v<version>` tag is upstream's commit. `release.yml` refuses any other tag, and a package that is not `@ahpio/sandbox-runtime`.
 
 ## Pass 1 - 2026-11-22, upstream v0.0.83
 
@@ -31,3 +32,4 @@ A pass merges one upstream release into the `ahpio` branch and releases it. Pass
 - The fork's changes merged in PR #1 as `5ec7d8a`.
 - `0.0.83-rc.0` is on npm under `next`, published with provenance by `release.yml` run 45039413969 from the prerelease `v0.0.83-rc.0` on `2a71a1f`.
 - `latest` is `0.0.0`, a placeholder Softov published by hand so the trusted publisher could be set.
+- The first stable release, on 2026-11-23, was made on the tag `v0.0.83`. That tag is upstream's, so `release.yml` run 45185942136 packed upstream's tree, and npm refused `@anthropic-ai/sandbox-runtime@0.0.83`. Nothing was published, and the GitHub release was deleted. Fork tags are `ahpio-v<version>` from then on.
